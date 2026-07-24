@@ -77,3 +77,73 @@ def throttleNominatim():
 
 
 initOsmnx()
+
+
+# Filtering sets to prevent geocoder from mistaking cities or parks for university campuses
+NOT_CAMPUS = {"leisure", "shop", "tourism", "highway", "natural", "boundary"}
+
+EDU_TAG_PAIRS = {
+    ("amenity", "university"),
+    ("amenity", "college"),
+    ("amenity", "school"),
+    ("amenity", "research_institute"),
+    ("landuse", "education")
+}
+
+campusNameHints = ("university", "college", "institute of technology", "polytechnic", "academy", "ecole", "universidad", "universita")
+
+
+def looksLikeCampus(nominatimResult):
+    # Heuristic check to see if a search result is an educational polygon or random landmark
+    pair = (nominatimResult.get("class"), nominatimResult.get("type"))
+    if pair in EDU_TAG_PAIRS:
+        return True
+    if nominatimResult.get("class") in NOT_CAMPUS:
+        return False
+    dn = nominatimResult.get("display_name") or ""
+    if not isinstance(dn, str):
+        dn = str(dn)
+    return any(hint in dn.lower() for hint in campusNameHints)
+
+
+def queryNominatim(q, limit=5):
+    p = {
+        "q": q,
+        "format": "jsonv2",
+        "limit": limit,
+        "addressdetails": 1,
+        "extratags": 1,
+        "polygon_geojson": 1,
+    }
+    throttleNominatim()
+    r = requests.get(NOMINATIM_URL, params=p, headers=req_headers, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+
+def fetchOsmLayer(polygon_wkt, layer_key):
+    from shapely import wkt as swkt
+    poly = swkt.loads(polygon_wkt)
+    try:
+        gdf = ox.features_from_polygon(poly, tags=campus_tags[layer_key])
+        if gdf is None or gdf.empty:
+            return None
+        gdf = gdf.to_crs("EPSG:4326") if gdf.crs else gdf
+        return gdf.__geo_interface__
+    except Exception:
+        return None
+fetchOsmLayer = st.cache_data(show_spinner=False, ttl="6h")(fetchOsmLayer)
+
+
+def fetchOsmLayerRaw(polygon_wkt, layer_key):
+    # Returns raw GeoDataFrame so we can manipulate OSM IDs before JSON conversion
+    from shapely import wkt as swkt
+    poly = swkt.loads(polygon_wkt)
+    try:
+        gdf = ox.features_from_polygon(poly, tags=campus_tags[layer_key])
+        if gdf is None or gdf.empty:
+            return None
+        return gdf.to_crs("EPSG:4326") if gdf.crs else gdf
+    except Exception:
+        return None
+fetchOsmLayerRaw = st.cache_data(show_spinner=False, ttl="6h")(fetchOsmLayerRaw)
