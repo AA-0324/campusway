@@ -1,57 +1,66 @@
 # CampusWay
-CampusWay is an interactive geospatial web application designed to help new university students, freshmen, and visitors navigate sprawling college campuses. The app dynamically queries spatial vector data from OpenStreetMap to render color-coded campus layouts, building footprints, pedestrian pathways, and specialized facilities.
+
+An interactive geospatial web app built with Python and Streamlit that renders university campuses, pedestrian pathways, building footprints, and facilities using live OpenStreetMap (OSM) vector data.
 
 ---
 
-## Motivation and Problem Statement
+## Why I Built This
 
-Navigating a new university campus during orientation and the first weeks of classes is a major source of stress for incoming freshmen. Sprawling campuses often span hundreds of acres with dozens of interconnected buildings and pedestrian paths. 
+When incoming freshmen or visitors arrive on a college campus for orientation or the first week of classes, finding specific buildings or walking routes is surprisingly frustrating. 
 
-Existing navigation tools present key limitations:
-1. Standard vehicular navigation apps (e.g., Google Maps, Apple Maps) prioritize roads and driving routes, frequently missing pedestrian-only pathways, inner courtyards, and specific building outlines.
-2. University PDF orientation maps are static, non-interactive, difficult to search on mobile devices, and quickly become outdated.
+Standard navigation apps like Google Maps or Apple Maps are designed primarily for driving. They prioritize vehicular roads and often show campus grounds as a blank gray or green patch, completely skipping pedestrian footpaths, inner courtyards, and distinct building outlines. Official university maps, on the other hand, are usually static PDFs that are hard to read on a phone and can't be searched interactively.
 
-I built CampusWay to solve this problem. By combining real-time spatial geocoding with vector feature extraction, CampusWay allows students to search for any university globally and view an interactive, layer-controlled map that highlights exactly where they need to walk.
+I built CampusWay to solve this. You type in any university or college name, and the app queries spatial vector data to build a custom interactive map showing where students actually walk and where buildings and facilities are located.
 
 ---
 
-## Technical Features
+## How It Works Under the Hood
 
-- Natural Language Campus Search: Resolves global university, college, and institute names into spatial boundary polygons via Nominatim API integrations.
-- Layer-Based Spatial Isolation: Allows users to independently toggle visual layers for campus buildings, primary pedestrian pathways, roads, and specialized facilities (libraries, dining halls, fitness centers).
-- Interactive Leafmap Dashboard: Supports dynamic panning, zooming, full-screen viewing, and custom spatial color encoding.
-- API Rate Limiting and Caching: Implements session-state time gaps and resource caching to maintain responsiveness while complying with external API usage policies.
-
----
-
-## Engineering Challenges and Solutions
-
-Building CampusWay required resolving several data engineering and geospatial processing hurdles:
-
-1. Handling Unstructured Geocoding Boundaries
-Search queries for universities can return city points, whole administrative districts, or point locations instead of physical campus boundaries. I constructed a verification function that checks spatial tags, filters out non-educational amenities, and dynamically falls back to boundary geocoding if initial polygon data is missing.
-
-2. Polygon Duplication and Layer Overlap
-OpenStreetMap often tags specialized structures (such as campus libraries or sports complexes) under both general building tags and specialized amenity tags. Rendering both layers directly caused overlapping polygon artifacts and visual clutter. To resolve this, I engineered a deduplication function that extracts underlying OpenStreetMap IDs from GeoPandas MultiIndex structures, stripping duplicate building geometries before the final map compile.
-
-3. Efficient Geospatial Caching in Streamlit
-Streamlit re-runs scripts on user interactions, which can lead to repetitive spatial API calls and app crashes due to non-serializable GeoDataFrame caching. I solved this by serializing geometries into WKT (Well-Known Text) strings for caching, preserving performance while keeping API calls to a minimum.
+1. **Geocoding & Boundary Resolution:** The search term goes to the Nominatim geocoding API to resolve the campus polygon boundary.
+2. **Vector Data Extraction:** Once we have the campus boundary geometry, the app uses `OSMnx` to fetch raw vector data from OpenStreetMap across four spatial layers:
+   - Campus Buildings (`building=True`)
+   - Pedestrian Footpaths (`highway=footway, path, pedestrian, steps`)
+   - Internal Roads & Service Routes (`highway=service, residential, etc.`)
+   - Specialized Facilities (`amenity=library, food_court, cafe` and `leisure=sports_centre, fitness_centre`)
+3. **Data Deduplication & Cleaning:** Overlapping building geometries are filtered out before map compilation.
+4. **Interactive Map Rendering:** Layers are stylized and rendered on top of a clean CartoDB Positron base map using `leafmap` and `folium`.
 
 ---
 
-## Technology Stack
+## Engineering Bugs and Challenges I Fixed
 
-- Language: Python 3.10+
-- Web Framework: Streamlit
-- Spatial Data Extraction: OSMnx, Shapely, GeoPandas, Requests
-- Map Rendering: Leafmap, Folium
-- Data Source: OpenStreetMap / Nominatim API
+Building this app required handling several quirks with geospatial data and Streamlit's execution model:
+
+### 1. Stopping Nominatim API Rate-Limit Bans (HTTP 429)
+OpenStreetMap enforces a strict policy of no more than 1 request per second for its free Nominatim service. Because Streamlit re-runs the entire Python script whenever a user toggles a sidebar checkbox or clicks a button, rapid clicks caused the app to hit the API multiple times a second, leading to HTTP 429 errors or temporary IP blocks.
+
+* **Fix:** I wrote a `throttleNominatim()` function using `st.session_state` to track timestamps across re-renders. It calculates the time elapsed since the last API request and forces a short `time.sleep()` if the gap is under 1.1 seconds.
+
+### 2. Eliminating Overlapping Polygon Visual Artifacts
+OpenStreetMap frequently double-tags structures. For instance, a campus library might be tagged as both `building=yes` in the buildings layer and `amenity=library` in the facilities layer. Rendering both layers directly resulted in dark, muddy overlapping shapes.
+
+* **Fix:** I wrote a `stripDuplicateBuildings()` helper function. It extracts the raw `osmid` set from the facilities GeoDataFrame and strips matching IDs out of the main buildings GeoDataFrame *before* converting the shapes into GeoJSON features for map rendering.
+
+### 3. Caching Geospatial Data in Streamlit
+`GeoPandas` GeoDataFrames are complex Python objects that are difficult to cache directly in Streamlit without memory leaks or serialization errors. Re-fetching full vector sets on every map interaction made the app painfully slow.
+
+* **Fix:** I converted campus boundary geometries into WKT (Well-Known Text) strings. Passing plain text WKT strings into `@st.cache_data` allowed Streamlit to cache raw OSM responses for 6–24 hours, making map toggles instant without repeating network calls.
 
 ---
 
-## License
+## Tech Stack
 
-Distributed under the MIT License. See LICENSE file for full terms.
+- **Language:** Python 3.10+
+- **Frontend & Web Framework:** Streamlit
+- **Geospatial Processing:** `OSMnx`, `GeoPandas`, `Shapely`, `Requests`
+- **Mapping & Visualization:** `leafmap`, `folium`
+- **Data Sources:** OpenStreetMap, Nominatim Search API
 
+---
 
-:)
+## Running Locally
+
+1. Clone the repository:
+   ```bash
+   git clone [https://github.com/YOUR-USERNAME/CampusWay.git](https://github.com/YOUR-USERNAME/CampusWay.git)
+   cd CampusWay
