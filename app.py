@@ -147,3 +147,139 @@ def fetchOsmLayerRaw(polygon_wkt, layer_key):
     except Exception:
         return None
 fetchOsmLayerRaw = st.cache_data(show_spinner=False, ttl="6h")(fetchOsmLayerRaw)
+
+def stripDuplicateBuildings(buildingsDf, facilitiesDf):
+    # osm tags a lot of campus buildings as BOTH building=yes AND amenity=library
+    # (or cafe, gym, etc), which means without this step the same polygon ends up
+    # in both the buildings layer and the facilities layer, drawn on top of each other
+    #
+    # has to run BEFORE converting to geojson -- geopandas replaces the osm ids with
+    # sequential integers in the geojson output, so you can't match them up afterwards
+    if buildingsDf is None or buildingsDf.empty:
+        return buildingsDf
+
+    fac_ids = getIds(facilitiesDf)
+    if not fac_ids:
+        return buildingsDf
+
+    try:
+        bld_ids = getIds(buildingsDf)
+        overlap = bld_ids & fac_ids
+        if not overlap:
+            return buildingsDf
+
+        if isinstance(buildingsDf.index, pd.MultiIndex):
+            idList = [x[-1] if isinstance(x, tuple) else x for x in buildingsDf.index]
+        elif "osmid" in buildingsDf.columns:
+            idList = list(buildingsDf["osmid"])
+        else:
+            return buildingsDf
+
+        keep = [i not in overlap for i in idList]
+        return buildingsDf[keep]
+    except Exception:
+        return buildingsDf
+
+
+def findCampus(name):
+    results = queryNominatim(name)
+    if not results:
+        raise ValueError(f'No results found for **"{name}"** on OpenStreetMap.\n\nTry a more specific name, e.g. `"{name}, City, Country"`')
+
+    results.sort(key=lambda r: not looksLikeCampus(r))
+    edu_hits = [r for r in results if looksLikeCampus(r)]
+
+    for hit in edu_hits:
+        geo = hit.get("geojson") or {}
+        if geo.get("type") not in ("Polygon", "MultiPolygon"):
+            continue
+        try:
+            g = shape(geo)
+            if not g.is_valid:
+                g = g.buffer(0)  # Buffer(0) trick to fix self-intersecting complex geometries
+            if g.is_empty:
+                continue
+            return hit.get("display_name", name), g.wkt
+        except Exception:
+            continue
+
+    top_hit = edu_hits[0] if edu_hits else results[0]
+    hitName = top_hit.get("display_name", name)
+
+    try:
+        throttleNominatim()
+        gdf = ox.geocode_to_gdf(hitName)
+    except Exception as e:
+        raise ValueError(f'Found **"{hitName}"** but could not get its boundary.\n\nError: `{e}`')
+
+    if gdf.empty or gdf.iloc[0].geometry.geom_type not in ("Polygon", "MultiPolygon"):
+        raise ValueError(
+            f'**"{hitName}"** is in OSM but only as a point, not a boundary polygon.\n\n'
+            f'Try a more specific search or check [openstreetmap.org](https://www.openstreetmap.org).'
+        )
+
+    g = gdf.iloc[0].geometry
+    if not g.is_valid:
+        g = g.buffer(0)
+    return hitName, g.wkt
+findCampus = st.cache_data(show_spinner=False, ttl="24h")(findCampus)
+
+
+def buildCampusMap(polygon_wkt, active_layers, status):
+    from shapely import wkt as swkt
+    poly = swkt.loads(polygon_wkt)
+    minx, miny, maxx, maxy = poly.bounds
+    cLat = (miny + maxy) / 2
+    cLon = (minx + maxx) / 2
+
+    # CartoDB Positron gives a clean base map so campus vectors pop visually
+    m = leafmap.Map(center=[cLat, cLon], zoom=15, tiles="CartoDB.Positron")
+
+    folium_plugins.Fullscreen(
+        position="topright",
+        title="Expand map",
+        title_cancel="Exit fullscreen",
+        force_separate_button=True
+    ).add_to(m)
+
+    layerData = {}
+
+    for k in ("roads", "walkways"):
+        if k in active_layers:
+            status.update(label=f"Fetching {layer_labels[k]}...")
+            layerData[k] = fetchOsmLayer(polygon_wkt, k)
+
+    facGdf = None
+    if "facilities" in active_layers:
+        status.update(label=f"Fetching {layer_labels['facilities']}...")
+        facGdf = fetchOsmLayerRaw(polygon_wkt, "facilities")
+        layerData["facilities"] = facGdf.__geo_interface__ if facGdf is not None else None
+
+    if "buildings" in active_layers:
+        status.update(label=f"Fetching {layer_labels['buildings']}...")
+        bldGdf = fetchOsmLayerRaw(polygon_wkt, "buildings")
+        bldGdf = stripDuplicateBuildings(bldGdf, facGdf)
+        layerData["buildings"] = bldGdf.__geo_interface__ if bldGdf is not None else None
+
+    # Order matters: background network first, then structures, then key facilities on top
+    drawOrder = ["roads", "walkways", "buildings", "facilities"]
+    counts = {}
+    foundAnything = False
+
+    for k in drawOrder:
+        if k not in layerData:
+            continue
+        geo = layerData[k]
+        if not geo or not geo.get("features"):
+            counts[k] = 0
+            continue
+        counts[k] = len(geo["features"])
+        m.add_geojson(geo, layer_name=layer_labels[k], style_function=campusStyles[k])
+        foundAnything = True
+
+    if not foundAnything:
+        raise ValueError("OSM has no tagged data for this campus. Try a different campus or check openstreetmap.org.")
+
+    m.fit_bounds([[miny, minx], [maxy, maxx]])
+
+    return m, counts
