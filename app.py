@@ -283,3 +283,72 @@ def buildCampusMap(polygon_wkt, active_layers, status):
     m.fit_bounds([[miny, minx], [maxy, maxx]])
 
     return m, counts
+
+use_facilities = True
+
+with st.sidebar:
+    st.title("Campus Navigation Controls")
+    campusInput = st.text_input(
+        "University or college name",
+        placeholder='e.g. "MIT" or "Foothill College, CA"',
+        help="Full names, partial names, and acronyms all work. Add a city or country if you get the wrong result. Press Enter or click Generate Map below."
+    )
+
+    showBuildings = st.checkbox("Campus Buildings", value=True)
+    showPaths = st.checkbox("Pedestrian Paths", value=True)
+    showRoads = st.checkbox("Roads & Service Routes", value=True)
+    showFacilities = st.checkbox("Specialized Facilities", value=use_facilities)
+
+    searchBtn = st.button("Generate Map", type="primary", use_container_width=True)
+
+    active_layers = []
+    if showPaths:
+        active_layers.append("walkways")
+    if showBuildings:
+        active_layers.append("buildings")
+    if showFacilities:
+        active_layers.append("facilities")
+    if showRoads:
+        active_layers.append("roads")
+
+if not searchBtn or not campusInput.strip():
+    st.stop()
+
+searchTerm = campusInput.strip()
+err = None
+
+with st.status(f'Looking up "{searchTerm}"... (large campuses can take 30-60s)', expanded=True) as status:
+    try:
+        campusName, campusPoly = findCampus(searchTerm)
+        status.update(label=f"Found: {campusName}", state="running")
+    except ValueError as e:
+        status.update(label="Could not find campus", state="error")
+        err = ("error", str(e))
+    except Exception as e:
+        status.update(label="Unexpected error", state="error")
+        err = ("error", f"Something went wrong: `{e}`")
+
+    if err is None and not active_layers:
+        status.update(label="No layers selected", state="error")
+        err = ("warning", "Select at least one layer in the sidebar.")
+
+    if err is None:
+        try:
+            campusMap, layerCounts = buildCampusMap(campusPoly, active_layers, status)
+            status.update(label=f"Map ready - {campusName}", state="complete", expanded=False)
+        except ValueError as e:
+            status.update(label="No OSM data found", state="error")
+            err = ("warning", str(e))
+        except Exception as e:
+            status.update(label="Map build failed", state="error")
+            err = ("error", f"Could not build map: `{e}`")
+
+if err is not None:
+    kind, msg = err
+    if kind == "error":
+        st.error(msg)
+    else:
+        st.warning(msg)
+    st.stop()
+
+campusMap.to_streamlit(height=620)
