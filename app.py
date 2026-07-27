@@ -7,6 +7,7 @@ st.set_page_config(
 
 import time
 import html
+import re
 import requests
 import pandas as pd
 import geopandas as gpd
@@ -147,11 +148,14 @@ FALLBACK_TAG = {
 }
 
 
+USELESS_CATEGORY_VALUES = {"yes", "university", "college"}
+
+
 def _friendly(value):
     if not isinstance(value, str):
         return None
     value = value.strip()
-    if not value or value.lower() == "yes":
+    if not value or value.lower() in USELESS_CATEGORY_VALUES:
         return None
     return value.replace("_", " ").replace("-", " ").title()
 
@@ -244,6 +248,7 @@ def fetchRoadsAndWalkways(polygon_wkt):
         # disconnected OSM ways, so this must be a union of all of them, not just
         # the first one found (unlike buildings, which are single polygons)
         namedRoads = {}
+        namedRoadGeo = {}  # GeoJSON segments for highlighted rendering
         for segment_gdf in (roads, walkways):
             if segment_gdf.empty or "name" not in segment_gdf.columns:
                 continue
@@ -254,14 +259,23 @@ def fetchRoadsAndWalkways(polygon_wkt):
                     continue
                 minx, miny, maxx, maxy = group.total_bounds
                 namedRoads[name] = _mergeBounds(namedRoads.get(name), miny, minx, maxy, maxx)
+                # accumulate GeoJSON for highlight layer
+                geo_chunk = group.__geo_interface__
+                if name not in namedRoadGeo:
+                    namedRoadGeo[name] = geo_chunk
+                else:
+                    # merge feature lists
+                    existing_feats = namedRoadGeo[name].get("features", [])
+                    new_feats = geo_chunk.get("features", [])
+                    namedRoadGeo[name] = {"type": "FeatureCollection", "features": existing_feats + new_feats}
 
         walkways = addLabelAndTrim(walkways, "walkways")
         roads = addLabelAndTrim(roads, "roads")
         walkGeo = walkways.__geo_interface__ if walkways is not None and not walkways.empty else None
         roadGeo = roads.__geo_interface__ if roads is not None and not roads.empty else None
-        return roadGeo, walkGeo, namedRoads
+        return roadGeo, walkGeo, namedRoads, namedRoadGeo
     except Exception:
-        return None, None, {}
+        return None, None, {}, {}
 fetchRoadsAndWalkways = st.cache_data(show_spinner=False, ttl="6h")(fetchRoadsAndWalkways)
 
 
@@ -321,6 +335,17 @@ def stripDuplicateBuildings(buildingsDf, facilitiesDf):
         return buildingsDf
 
 
+def _alternateNameGuess(name):
+    # common naming confusion: "University of X" vs the institution's real name
+    # "X University" (and same for College) -- try the swap as a genuine second
+    # attempt rather than assuming either order is always correct
+    m = re.match(r'^(university|college)\s+of\s+(.+)$', name.strip(), re.IGNORECASE)
+    if not m:
+        return None
+    kind, rest = m.groups()
+    return f"{rest.strip()} {kind.title()}"
+
+
 def findCampus(name):
     results = queryNominatim(name)
     if not results:
@@ -328,6 +353,26 @@ def findCampus(name):
 
     results.sort(key=lambda r: not looksLikeCampus(r))
     edu_hits = [r for r in results if looksLikeCampus(r)]
+
+    if not edu_hits:
+        alt = _alternateNameGuess(name)
+        if alt:
+            try:
+                altResults = queryNominatim(alt)
+                altResults.sort(key=lambda r: not looksLikeCampus(r))
+                altEduHits = [r for r in altResults if looksLikeCampus(r)]
+                if altEduHits:
+                    edu_hits = altEduHits
+                    results = altResults
+            except Exception:
+                pass  # if the alternate attempt fails for any reason, fall through to the honest error below
+
+    if not edu_hits:
+        raise ValueError(
+            f'None of the search results for **"{name}"** look like a university or college.\n\n'
+            f'Try the institution\'s full official name (for example, "Carleton University" '
+            f'rather than "University of Carleton"), or add a city/country for a more specific match.'
+        )
 
     for hit in edu_hits:
         geo = hit.get("geojson") or {}
@@ -343,7 +388,7 @@ def findCampus(name):
         except Exception:
             continue
 
-    top_hit = edu_hits[0] if edu_hits else results[0]
+    top_hit = edu_hits[0]
     hitName = top_hit.get("display_name", name)
 
     try:
@@ -383,14 +428,16 @@ def buildCampusMap(polygon_wkt, active_layers, status):
 
     layerData = {}
     namedRoads = {}
+    namedRoadGeo = {}
 
     if "roads" in active_layers or "walkways" in active_layers:
         status.update(label="Fetching roads and pedestrian paths...")
-        roadGeo, walkGeo, namedRoads = fetchRoadsAndWalkways(polygon_wkt)
+        roadGeo, walkGeo, namedRoads, namedRoadGeo = fetchRoadsAndWalkways(polygon_wkt)
         if "roads" in active_layers:
             layerData["roads"] = roadGeo
         if "walkways" in active_layers:
             layerData["walkways"] = walkGeo
+        # namedRoadGeo is populated inside fetchRoadsAndWalkways above
 
     bldGdf = facGdf = None
     if "buildings" in active_layers or "facilities" in active_layers:
@@ -437,7 +484,8 @@ def buildCampusMap(polygon_wkt, active_layers, status):
                 centroid = row.geometry.centroid
                 label = row["Label"]
                 category = row.get("Category")
-                display = f"{label} ({category})" if category else label
+                hasCategory = isinstance(category, str) and pd.notna(category) and category.strip()
+                display = f"{label} ({category})" if hasCategory else label
                 key = display
                 n = 2
                 while key in namedLocations:
@@ -471,7 +519,7 @@ def buildCampusMap(polygon_wkt, active_layers, status):
         legend._template = Template(legend_html)
         m.get_root().add_child(legend)
 
-    return m, counts, namedLocations, namedRoads
+    return m, counts, namedLocations, namedRoads, namedRoadGeo
 
 
 # ── sidebar ──────────────────────────────────────────────────────────────────
@@ -543,6 +591,7 @@ if searchBtn and campusInput.strip():
         st.session_state.pop("campusMap", None)
         st.session_state.pop("namedLocations", None)
         st.session_state.pop("namedRoads", None)
+        st.session_state.pop("namedRoadGeo", None)
 
 searchTerm = st.session_state.get("lastSearch", "")
 
@@ -569,10 +618,11 @@ if "campusMap" not in st.session_state:
 
         if err is None:
             try:
-                campusMap, layerCounts, namedLocations, namedRoads = buildCampusMap(campusPoly, active_layers, status)
+                campusMap, layerCounts, namedLocations, namedRoads, namedRoadGeo = buildCampusMap(campusPoly, active_layers, status)
                 st.session_state["campusMap"] = campusMap
                 st.session_state["namedLocations"] = namedLocations
                 st.session_state["namedRoads"] = namedRoads
+                st.session_state["namedRoadGeo"] = namedRoadGeo
                 status.update(label=f"Map ready - {campusName}", state="complete", expanded=False)
             except ValueError as e:
                 status.update(label="No OSM data found", state="error")
@@ -616,5 +666,48 @@ elif focusRoad and focusRoad in st.session_state.get("namedRoads", {}):
     padLat = max((n - s) * 0.15, 0.0005)
     padLon = max((e - w) * 0.15, 0.0005)
     campusMap.fit_bounds([[s - padLat, w - padLon], [n + padLat, e + padLon]])
+    # highlight the matched road segments with a vivid overlay
+    roadGeoData = st.session_state.get("namedRoadGeo", {}).get(focusRoad)
+    if roadGeoData:
+        folium.GeoJson(
+            data=roadGeoData,
+            name="__highlight__",
+            style_function=lambda feat: {
+                "color": "#ff6600",
+                "weight": 6,
+                "opacity": 0.85,
+            },
+            tooltip=folium.Tooltip(focusRoad),
+        ).add_to(campusMap)
+
+# ── CampusWay branding (map overlay) ─────────────────────────────────────────
+branding_html = """
+{% macro html(this, kwargs) %}
+<div style="
+    position: fixed;
+    top: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 9999;
+    background: rgba(255,255,255,0.92);
+    backdrop-filter: blur(4px);
+    padding: 5px 14px;
+    border-radius: 20px;
+    box-shadow: 0 1px 6px rgba(0,0,0,0.18);
+    font-family: 'Helvetica Neue', Arial, sans-serif;
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    color: #1a1a2e;
+    user-select: none;
+    pointer-events: none;
+">
+    <span style="color:#1f77b4;">Campus</span><span style="color:#ff6600;">Way</span>
+</div>
+{% endmacro %}
+"""
+branding = MacroElement()
+branding._template = Template(branding_html)
+campusMap.get_root().add_child(branding)
 
 campusMap.to_streamlit(height=620)
