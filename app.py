@@ -3,6 +3,8 @@ import streamlit as st
 st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
+    page_title="CampusWay",
+    page_icon="🧭",
 )
 
 import time
@@ -18,6 +20,30 @@ from shapely.geometry import shape, box as shapelyBox
 from folium import plugins as folium_plugins
 import leafmap.foliumap as leafmap
 import osmnx as ox
+
+
+MAX_FEATURES_PER_LAYER = 6000
+
+# ── CARTO basemap tile URL with API key (removes watermark) ──────────────────
+CARTO_KEY = "cb1_2ely_1_56403dce0becb94f8ac75d76"
+CARTO_TILE_URL = (
+    f"https://{{s}}.basemaps.cartocdn.com/rastertiles/light_all/{{z}}/{{x}}/{{y}}.png"
+    f"?key={CARTO_KEY}"
+)
+CARTO_ATTRIBUTION = (
+    '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors, '
+    '&copy; <a href="https://carto.com/attributions">CARTO</a>'
+)
+
+
+def _capFeatures(gdf, maxRows=MAX_FEATURES_PER_LAYER):
+    if gdf is None or len(gdf) <= maxRows:
+        return gdf
+    try:
+        areas = gdf.geometry.area
+        return gdf.loc[areas.sort_values(ascending=False).index[:maxRows]]
+    except Exception:
+        return gdf.iloc[:maxRows]
 
 
 def getIds(gdf):
@@ -56,28 +82,57 @@ def styleFor(color, fill, opacity, weight, dashed=False):
     return lambda feat: s
 
 campusStyles = {
-    "buildings":  styleFor("#1f77b4", "#1f77b4", 0.45, 1.0),
-    "walkways":   styleFor("#2ca02c", "#2ca02c", 0.0,  2.5, dashed=True),
-    "roads":      styleFor("#7f7f7f", "#7f7f7f", 0.0,  1.5),
-    "facilities": styleFor("#d62728", "#d62728", 0.7,  1.5),
+    "buildings":  styleFor("#3A6EA5", "#3A6EA5", 0.45, 1.0),
+    "walkways":   styleFor("#1F6F54", "#1F6F54", 0.0,  2.5, dashed=True),
+    "roads":      styleFor("#726B5E", "#726B5E", 0.0,  1.5),
+    "facilities": styleFor("#A02B5C", "#A02B5C", 0.7,  1.5),
 }
 
 LAYER_COLORS = {
-    "buildings":  "#1f77b4",
-    "walkways":   "#2ca02c",
-    "roads":      "#7f7f7f",
-    "facilities": "#d62728",
+    "buildings":  "#3A6EA5",
+    "walkways":   "#1F6F54",
+    "roads":      "#726B5E",
+    "facilities": "#A02B5C",
 }
 
 req_headers = {"User-Agent": "global-campus-navigator/1.0 (streamlit-app)"}
 RATE_LIMIT_GAP = 1.5
 
 
+OVERPASS_MIRRORS = [
+    "https://overpass-api.de/api",
+    "https://overpass.kumi.systems/api",
+]
+
+
 @st.cache_resource
 def initOsmnx():
     ox.settings.use_cache = True
     ox.settings.log_console = False
+    ox.settings.requests_timeout = 20
+    ox.settings.overpass_url = OVERPASS_MIRRORS[0]
     return True
+
+
+def fetchFromOverpass(fetchFn, *args, _status=None):
+    lastErr = None
+    for i, mirror in enumerate(OVERPASS_MIRRORS):
+        if _status is not None:
+            word = "Trying" if i == 0 else "That was slow -- trying a backup"
+            _status.write(f"{word} OpenStreetMap server (up to {ox.settings.requests_timeout}s)...")
+        ox.settings.overpass_url = mirror
+        try:
+            return fetchFn(*args)
+        except Exception as e:
+            lastErr = e
+            continue
+    ox.settings.overpass_url = OVERPASS_MIRRORS[0]
+    raise RuntimeError(
+        f"OpenStreetMap's Overpass data service didn't respond after trying "
+        f"{len(OVERPASS_MIRRORS)} server(s). This is a shared free service and "
+        f"it does get overloaded, especially for large campuses -- it's not a "
+        f"sign that this campus lacks data. Raw error: {lastErr}"
+    )
 
 
 def throttleNominatim():
@@ -90,23 +145,48 @@ def throttleNominatim():
 
 initOsmnx()
 
-NOT_CAMPUS = {"leisure", "shop", "tourism", "highway", "natural", "boundary"}
+# ── campus detection ─────────────────────────────────────────────────────────
+# NOT_CAMPUS previously included "boundary" -- but university campuses are
+# frequently mapped in OSM as boundary relations (type=boundary,
+# boundary=administrative or boundary=place), so that exclusion was silently
+# rejecting real campuses like MIT, Caltech, and many others that happen to
+# be stored as relation boundaries rather than amenity polygons in OSM.
+# Removed "boundary" from the hard-exclusion set; the positive EDU_TAG_PAIRS
+# and campusNameHints checks already handle the real filtering correctly.
+NOT_CAMPUS = {"leisure", "shop", "tourism", "highway", "natural"}
 
 EDU_TAG_PAIRS = {
     ("amenity", "university"),
     ("amenity", "college"),
     ("amenity", "school"),
     ("amenity", "research_institute"),
-    ("landuse", "education")
+    ("landuse", "education"),
+    ("boundary", "educational"),    # additional OSM tagging pattern used for
+    ("place", "campus"),            # many large US/UK/AU research campuses
 }
 
-campusNameHints = ("university", "college", "institute of technology", "polytechnic", "academy", "ecole", "universidad", "universita")
+campusNameHints = (
+    "university",
+    "college",
+    "institute of technology",
+    "polytechnic",
+    "academy",
+    "ecole",
+    "universidad",
+    "universita",
+    "mit",          # well-known acronyms that don't contain a hint word
+    "caltech",
+    "mit.edu",
+)
 
 
 def looksLikeCampus(nominatimResult):
     pair = (nominatimResult.get("class"), nominatimResult.get("type"))
     if pair in EDU_TAG_PAIRS:
         return True
+    # Hard-exclusion: classes that are unambiguously NOT a campus no matter
+    # what their display name says (a shop named "University Bookstore" should
+    # not be treated as a campus result).
     if nominatimResult.get("class") in NOT_CAMPUS:
         return False
     dn = nominatimResult.get("display_name") or ""
@@ -119,13 +199,6 @@ PHOTON_URL = "https://photon.komoot.io/api/"
 
 
 def queryPhoton(q, limit=5):
-    # Komoot's Photon is a completely separate service/infrastructure built
-    # on OSM data -- different servers, different rate-limit bucket from
-    # Nominatim. It's not a full replacement (no detailed boundary polygons,
-    # just a point + a rough bounding box), but when Nominatim itself is
-    # having a bad moment, having ANY independent path to try is the
-    # difference between a hard failure and a working, if slightly less
-    # precise, result.
     p = {"q": q, "limit": limit}
     r = requests.get(PHOTON_URL, params=p, headers=req_headers, timeout=10)
     r.raise_for_status()
@@ -141,7 +214,7 @@ def queryPhoton(q, limit=5):
         display_name = ", ".join(x for x in parts if x)
 
         boundingbox = None
-        extent = props.get("extent")  # Photon: [minLon, maxLat, maxLon, minLat]
+        extent = props.get("extent")
         if extent and len(extent) == 4:
             minLon, maxLat, maxLon, minLat = extent
             boundingbox = [str(minLat), str(maxLat), str(minLon), str(maxLon)]
@@ -152,7 +225,7 @@ def queryPhoton(q, limit=5):
             "display_name": display_name,
             "osm_type": props.get("osm_type"),
             "osm_id": props.get("osm_id"),
-            "geojson": None,  # Photon doesn't return full boundary polygons
+            "geojson": None,
             "boundingbox": boundingbox,
             "lat": coords[1] if coords else None,
             "lon": coords[0] if coords else None,
@@ -168,15 +241,6 @@ def queryNominatim(q, limit=5, _status=None):
         "addressdetails": 1,
         "polygon_geojson": 1,
     }
-
-    # NOTE: this used to retry 5 times with backoff (~40s worst case) before
-    # giving up. If what we're actually hitting is a STANDING block on this
-    # host's shared IP (a real, documented issue -- Nominatim has been known
-    # to blanket-throttle Streamlit Community Cloud's egress IPs specifically,
-    # because so much hobby traffic hits it from there without following
-    # usage policy) then no amount of retrying fixes that, and 40s of
-    # retrying before ever trying the fallback is just wasted time. Fail fast
-    # instead, and let findCampus() move on to a genuinely different service.
     maxAttempts = 2
     backoffs = [2, 5]
     lastStatus = None
@@ -212,8 +276,6 @@ def queryNominatim(q, limit=5, _status=None):
             _status.write(f"OpenStreetMap returned HTTP 429 -- retrying in {int(wait)}s...")
         time.sleep(wait)
 
-    # Show the actual evidence instead of a canned guess, so this is
-    # verifiable instead of taking my word for it.
     raise ValueError(
         f"OpenStreetMap's search returned **HTTP {lastStatus}** on every attempt just now.\n\n"
         f"Raw response: `{lastBody or '(empty)'}`"
@@ -231,6 +293,15 @@ FALLBACK_TAG = {
 USELESS_CATEGORY_VALUES = {"yes", "university", "college"}
 
 
+def _friendlySeries(s):
+    is_str = s.map(lambda v: isinstance(v, str))
+    s = s.where(is_str)
+    s = s.str.strip()
+    useless = s.str.lower().isin(USELESS_CATEGORY_VALUES)
+    s = s.mask(useless | (s == ""))
+    return s.str.replace("_", " ", regex=False).str.replace("-", " ", regex=False).str.title()
+
+
 def _friendly(value):
     if not isinstance(value, str):
         return None
@@ -238,26 +309,6 @@ def _friendly(value):
     if not value or value.lower() in USELESS_CATEGORY_VALUES:
         return None
     return value.replace("_", " ").replace("-", " ").title()
-
-
-def _labelFor(row, layer_key):
-    name = row.get("name")
-    if isinstance(name, str) and name.strip():
-        return name.strip(), True
-    tag_col, fallback_word = FALLBACK_TAG[layer_key]
-    val = row.get(tag_col)
-    if layer_key == "facilities" and not _friendly(val):
-        val = row.get("leisure")
-    friendly = _friendly(val)
-    return (friendly if friendly else fallback_word), False
-
-
-def _categoryFor(row, layer_key):
-    tag_col, _ = FALLBACK_TAG[layer_key]
-    val = row.get(tag_col)
-    if layer_key == "facilities" and not _friendly(val):
-        val = row.get("leisure")
-    return _friendly(val)
 
 
 def addLabelAndTrim(gdf, layer_key):
@@ -269,20 +320,30 @@ def addLabelAndTrim(gdf, layer_key):
         keep_cols.append("osmid")
     try:
         gdf = gdf.copy()
-        labels = gdf.apply(lambda row: _labelFor(row, layer_key), axis=1)
-        gdf["Label"]    = labels.apply(lambda t: t[0])
-        gdf["HasName"]  = labels.apply(lambda t: t[1])
-        gdf["Category"] = gdf.apply(lambda row: _categoryFor(row, layer_key), axis=1)
+        tag_col, fallback_word = FALLBACK_TAG[layer_key]
+
+        name_s = gdf["name"] if "name" in gdf.columns else pd.Series([None] * len(gdf), index=gdf.index)
+        name_s = name_s.map(lambda v: v.strip() if isinstance(v, str) else None)
+        has_name = name_s.notna() & (name_s != "")
+
+        primary_col = gdf[tag_col] if tag_col in gdf.columns else pd.Series([None] * len(gdf), index=gdf.index)
+        category = _friendlySeries(primary_col)
+
+        if layer_key == "facilities" and "leisure" in gdf.columns:
+            category = category.fillna(_friendlySeries(gdf["leisure"]))
+
+        label = name_s.where(has_name, category.fillna(fallback_word))
+
+        gdf["Label"] = label
+        gdf["HasName"] = has_name
+        gdf["Category"] = category
         keep_cols += ["Label", "HasName", "Category"]
         return gdf[keep_cols]
     except Exception:
         return gdf
 
 
-SIMPLIFY_TOLERANCE = 0.00005  # ~5.5m at typical campus latitudes -- was 4.4m;
-# vertex count is the dominant cost in every single render (this map is
-# rebuilt from scratch on every sidebar interaction), and sub-2m precision is
-# invisible at the zoom levels this app is actually used at
+SIMPLIFY_TOLERANCE = 0.00005
 
 
 def _simplify(gdf):
@@ -297,8 +358,6 @@ def _simplify(gdf):
 
 
 def makeTooltip():
-    # each layer needs its OWN instance -- reusing one object is a documented
-    # folium bug that causes a JS collision and blanks the map
     return folium.GeoJsonTooltip(fields=["Label"], labels=False, sticky=False)
 
 
@@ -320,9 +379,6 @@ def _haversineMeters(lat1, lon1, lat2, lon2):
 
 
 def nearbyLocations(focusLoc, focusName, allLocs, maxResults=4, maxMeters=300):
-    # cheap, purely local computation over data already fetched -- no extra
-    # network calls -- so this is essentially free to show whenever a
-    # student picks a building
     if not focusLoc:
         return []
     flat, flon = focusLoc
@@ -338,11 +394,6 @@ def nearbyLocations(focusLoc, focusName, allLocs, maxResults=4, maxMeters=300):
 
 
 def _editDistance(a, b):
-    # classic Levenshtein edit distance (single-row DP) -- a freshman on a
-    # campus they've never seen doesn't know a building's exact official
-    # name or spelling, and typos happen on a phone keyboard constantly.
-    # This is what makes "libary" or "student unio" still find the right
-    # building instead of returning nothing.
     if a == b:
         return 0
     la, lb = len(a), len(b)
@@ -366,18 +417,10 @@ def _fuzzyScore(query, candidate):
     if not q:
         return 0
     if q in c:
-        # a direct substring hit is a very strong signal -- rank earlier,
-        # tighter matches above later, looser ones
         return 1000 - c.index(q) - abs(len(c) - len(q)) * 0.1
-    # typo-tolerant fallback: compare the query against the whole candidate
-    # AND against each individual word in it, so "libary" still matches
-    # "Central Library (Library)" even though the full strings differ a lot
     words = re.split(r"[\s()]+", c)
     candidates = [w for w in words if w] + [c]
     bestWord, best = min(((w, _editDistance(q, w)) for w in candidates), key=lambda t: t[1])
-    # how many edits count as "a plausible typo" scales with word length --
-    # 2 edits is reasonable on a 10-letter word, not on a 4-letter one, so a
-    # flat cutoff would either miss real typos or return unrelated junk
     maxAllowed = max(1, min(len(q), len(bestWord)) // 2)
     if best > maxAllowed:
         return 0
@@ -392,9 +435,6 @@ def fuzzySearch(query, names, limit=6, minScore=1):
 
 
 def _geomBounds(geometry):
-    # walk a GeoJSON geometry's (possibly nested) coordinates to get min/max
-    # lon/lat -- works for LineString, MultiLineString, or anything else
-    # without caring about the specific nesting depth
     if not geometry:
         return None
     pts = []
@@ -417,13 +457,6 @@ def _geomBounds(geometry):
 
 
 def _roundGeoJson(geo, precision=5):
-    # OSM/shapely coordinates default to ~15-17 significant digits when
-    # serialized -- way beyond what matters for someone navigating on foot.
-    # 5 decimal places is ~1.1m at campus latitudes: comfortably inside a
-    # phone's own GPS accuracy, so there's no real-world precision lost, and
-    # it shrinks the GeoJSON payload substantially, which directly cuts
-    # caching time, network transfer to the browser, and the browser's own
-    # JSON-parse + render time.
     if not geo:
         return geo
 
@@ -442,11 +475,6 @@ def _roundGeoJson(geo, precision=5):
 
 
 def _stripUnusedProps(geo, keep=("Label",)):
-    # Only "Label" is ever read client-side, by the hover tooltip. HasName,
-    # Category, and osmid exist purely to help build the search index
-    # server-side (see fetchRoadsAndWalkways / namedLocations) and have zero
-    # use after that -- shipping them to the browser on every single feature
-    # is pure waste, and it adds up fast across thousands of features.
     if not geo:
         return geo
     for feat in geo.get("features", []):
@@ -457,10 +485,6 @@ def _stripUnusedProps(geo, keep=("Label",)):
 
 
 def _segmentEndpoints(geometry):
-    # the two (or more, for MultiLineString) endpoint coordinates of a road
-    # segment -- used purely to detect "these two OSM ways physically touch",
-    # since OSM ways that share a real-world junction share an identical
-    # coordinate at that point
     if not geometry:
         return []
     gtype = geometry.get("type")
@@ -480,24 +504,6 @@ def _segmentEndpoints(geometry):
 
 
 def _propagateRoadNames(features, maxHops=6):
-    """Real campus roads are almost always mapped in OSM as many small,
-    disconnected ways -- a driveway stub here, a service-road fork there --
-    and typically only ONE of those ways actually carries the `name` tag,
-    even though they're all physically the same strip of pavement. Left as
-    literal name-tag matches, that means a named road is only ever partly
-    searchable and only ever partly highlighted (exactly the two bugs this
-    fixes).
-
-    This is a multi-source breadth-first search: start from every segment
-    that already has a real name, and spread that name outward through
-    directly-touching (shared-endpoint) segments that have NO name of their
-    own -- never through a segment that already carries a *different* name,
-    so two genuinely different named roads that happen to meet at an
-    intersection never bleed into each other. Hop-limited so one named road
-    can't accidentally swallow an entire unrelated service-road network many
-    junctions away.
-
-    Returns {feature_index: effective_name}."""
     endpointOwners = {}
     for i, feat in enumerate(features):
         for pt in _segmentEndpoints(feat.get("geometry")):
@@ -521,110 +527,90 @@ def _propagateRoadNames(features, maxHops=6):
         for pt in _segmentEndpoints(features[i].get("geometry")):
             for j in endpointOwners.get(pt, ()):
                 if j in effectiveName:
-                    continue  # already named -- its own name, or already claimed
+                    continue
                 effectiveName[j] = name
                 queue.append((j, hops + 1))
 
     return effectiveName
 
 
-def fetchRoadsAndWalkways(polygon_wkt):
-    # ONE combined Overpass query for both roads and walkways (both are highway=*
-    # tags, just different values) instead of two separate round-trips -- OSMnx
-    # documents this union behavior explicitly and it's covered by their own test
-    # suite, so this is a supported pattern, not a workaround.
+def fetchRoadsAndWalkways(polygon_wkt, _status=None):
     from shapely import wkt as swkt
     poly = swkt.loads(polygon_wkt)
-    try:
-        gdf = ox.features_from_polygon(poly, tags={"highway": WALKWAY_VALUES + ROAD_VALUES})
-        if gdf is None or gdf.empty or "highway" not in gdf.columns:
-            return None, None, {}, {}
-        gdf = gdf.to_crs("EPSG:4326") if gdf.crs else gdf
-        gdf = _simplify(gdf)
 
-        walkways = gdf[gdf["highway"].isin(WALKWAY_VALUES)].copy()
-        roads = gdf[gdf["highway"].isin(ROAD_VALUES)].copy()
-
-        walkways = addLabelAndTrim(walkways, "walkways")
-        roads = addLabelAndTrim(roads, "roads")
-        walkGeo = walkways.__geo_interface__ if walkways is not None and not walkways.empty else None
-        roadGeo = roads.__geo_interface__ if roads is not None and not roads.empty else None
-        walkGeo = _roundGeoJson(walkGeo)
-        roadGeo = _roundGeoJson(roadGeo)
-
-        # named-road index built directly from the SAME GeoJSON that gets
-        # rendered/tooltipped on the map (not a separate pre-trim pass over the
-        # raw dataframe) -- that guarantees every road the map draws is
-        # guaranteed to be consistent with what's searchable. Names are
-        # propagated across touching unnamed segments first (see
-        # _propagateRoadNames) so a road split into many partially-tagged OSM
-        # ways is treated -- and highlighted -- as the single connected road
-        # it actually is, not just whichever fragment happened to carry the tag.
-        allFeatures = []
-        for geo in (roadGeo, walkGeo):
-            if geo:
-                allFeatures.extend(geo.get("features", []))
-
-        effectiveNames = _propagateRoadNames(allFeatures)
-
-        namedRoads = {}
-        namedRoadGeo = {}
-        for i, feat in enumerate(allFeatures):
-            name = effectiveNames.get(i)
-            if not name:
-                continue
-
-            b = _geomBounds(feat.get("geometry"))
-            if b:
-                minx, miny, maxx, maxy = b
-                namedRoads[name] = _mergeBounds(namedRoads.get(name), miny, minx, maxy, maxx)
-
-            if name not in namedRoadGeo:
-                namedRoadGeo[name] = {"type": "FeatureCollection", "features": [feat]}
-            else:
-                namedRoadGeo[name]["features"].append(feat)
-
-        # done building the search index off HasName/Label -- now drop every
-        # property except Label from what actually gets shipped to render
-        roadGeo = _stripUnusedProps(roadGeo)
-        walkGeo = _stripUnusedProps(walkGeo)
-
-        return roadGeo, walkGeo, namedRoads, namedRoadGeo
-    except Exception:
+    gdf = fetchFromOverpass(ox.features_from_polygon, poly, {"highway": WALKWAY_VALUES + ROAD_VALUES}, _status=_status)
+    if gdf is None or gdf.empty or "highway" not in gdf.columns:
         return None, None, {}, {}
+    gdf = gdf.to_crs("EPSG:4326") if gdf.crs else gdf
+    gdf = _simplify(gdf)
+    gdf = _capFeatures(gdf)
+
+    walkways = gdf[gdf["highway"].isin(WALKWAY_VALUES)].copy()
+    roads = gdf[gdf["highway"].isin(ROAD_VALUES)].copy()
+
+    walkways = addLabelAndTrim(walkways, "walkways")
+    roads = addLabelAndTrim(roads, "roads")
+    walkGeo = walkways.__geo_interface__ if walkways is not None and not walkways.empty else None
+    roadGeo = roads.__geo_interface__ if roads is not None and not roads.empty else None
+    walkGeo = _roundGeoJson(walkGeo)
+    roadGeo = _roundGeoJson(roadGeo)
+
+    allFeatures = []
+    for geo in (roadGeo, walkGeo):
+        if geo:
+            allFeatures.extend(geo.get("features", []))
+
+    effectiveNames = _propagateRoadNames(allFeatures)
+
+    namedRoads = {}
+    namedRoadGeo = {}
+    for i, feat in enumerate(allFeatures):
+        name = effectiveNames.get(i)
+        if not name:
+            continue
+
+        b = _geomBounds(feat.get("geometry"))
+        if b:
+            minx, miny, maxx, maxy = b
+            namedRoads[name] = _mergeBounds(namedRoads.get(name), miny, minx, maxy, maxx)
+
+        if name not in namedRoadGeo:
+            namedRoadGeo[name] = {"type": "FeatureCollection", "features": [feat]}
+        else:
+            namedRoadGeo[name]["features"].append(feat)
+
+    roadGeo = _stripUnusedProps(roadGeo)
+    walkGeo = _stripUnusedProps(walkGeo)
+
+    return roadGeo, walkGeo, namedRoads, namedRoadGeo
 fetchRoadsAndWalkways = st.cache_data(show_spinner=False, ttl="24h")(fetchRoadsAndWalkways)
 
 
-def fetchBuildingsAndFacilities(polygon_wkt):
-    # ONE combined query for buildings + facilities instead of two round-trips.
-    # a feature CAN legitimately have both building=yes and amenity=library --
-    # that's fine, it lands in both splits below, and the existing dedup step
-    # (stripDuplicateBuildings) already handles exactly that overlap correctly.
+def fetchBuildingsAndFacilities(polygon_wkt, _status=None):
     from shapely import wkt as swkt
     poly = swkt.loads(polygon_wkt)
-    try:
-        gdf = ox.features_from_polygon(poly, tags={
-            "building": True,
-            "amenity": FACILITY_AMENITY_VALUES,
-            "leisure": FACILITY_LEISURE_VALUES,
-        })
-        if gdf is None or gdf.empty:
-            return None, None
-        gdf = gdf.to_crs("EPSG:4326") if gdf.crs else gdf
-        gdf = _simplify(gdf)
 
-        has_building = gdf["building"].notna() if "building" in gdf.columns else pd.Series(False, index=gdf.index)
-        has_amenity = gdf["amenity"].isin(FACILITY_AMENITY_VALUES) if "amenity" in gdf.columns else pd.Series(False, index=gdf.index)
-        has_leisure = gdf["leisure"].isin(FACILITY_LEISURE_VALUES) if "leisure" in gdf.columns else pd.Series(False, index=gdf.index)
-
-        buildings = gdf[has_building].copy()
-        facilities = gdf[has_amenity | has_leisure].copy()
-
-        buildings = addLabelAndTrim(buildings, "buildings")
-        facilities = addLabelAndTrim(facilities, "facilities")
-        return buildings, facilities
-    except Exception:
+    gdf = fetchFromOverpass(ox.features_from_polygon, poly, {
+        "building": True,
+        "amenity": FACILITY_AMENITY_VALUES,
+        "leisure": FACILITY_LEISURE_VALUES,
+    }, _status=_status)
+    if gdf is None or gdf.empty:
         return None, None
+    gdf = gdf.to_crs("EPSG:4326") if gdf.crs else gdf
+    gdf = _simplify(gdf)
+    gdf = _capFeatures(gdf)
+
+    has_building = gdf["building"].notna() if "building" in gdf.columns else pd.Series(False, index=gdf.index)
+    has_amenity = gdf["amenity"].isin(FACILITY_AMENITY_VALUES) if "amenity" in gdf.columns else pd.Series(False, index=gdf.index)
+    has_leisure = gdf["leisure"].isin(FACILITY_LEISURE_VALUES) if "leisure" in gdf.columns else pd.Series(False, index=gdf.index)
+
+    buildings = gdf[has_building].copy()
+    facilities = gdf[has_amenity | has_leisure].copy()
+
+    buildings = addLabelAndTrim(buildings, "buildings")
+    facilities = addLabelAndTrim(facilities, "facilities")
+    return buildings, facilities
 fetchBuildingsAndFacilities = st.cache_data(show_spinner=False, ttl="24h")(fetchBuildingsAndFacilities)
 
 
@@ -652,9 +638,6 @@ def stripDuplicateBuildings(buildingsDf, facilitiesDf):
 
 
 def _alternateNameGuess(name):
-    # common naming confusion: "University of X" vs the institution's real name
-    # "X University" (and same for College) -- try the swap as a genuine second
-    # attempt rather than assuming either order is always correct
     m = re.match(r'^(university|college)\s+of\s+(.+)$', name.strip(), re.IGNORECASE)
     if not m:
         return None
@@ -666,19 +649,28 @@ def findCampus(name, _status=None):
     try:
         results = queryNominatim(name, _status=_status)
     except ValueError as nomErr:
-        # Nominatim's search step itself is failing (e.g. rate-limited) even
-        # after real retries -- try a fully independent service before
-        # giving up entirely, instead of failing outright on one provider
-        # having a bad moment
         if _status is not None:
             _status.write("OpenStreetMap search is unavailable -- trying a backup search service...")
         try:
             results = queryPhoton(name)
         except Exception:
-            raise nomErr  # the original Nominatim error is more specific -- surface that, not the backup's
+            raise nomErr
 
     if not results:
         raise ValueError(f'No results found for **"{name}"** on OpenStreetMap.\n\nTry a more specific name, e.g. `"{name}, City, Country"`')
+
+    # ── DEBUG: show raw Nominatim results so we can see exactly why
+    # the classifier is or isn't matching ──────────────────────────
+    if _status is not None:
+        _status.write(f"**Debug — raw results ({len(results)}):**")
+        for i, r in enumerate(results):
+            _status.write(
+                f"  [{i}] class={r.get('class')!r} category={r.get('category')!r} "
+                f"type={r.get('type')!r} osm_type={r.get('osm_type')!r} "
+                f"passes={looksLikeCampus(r)} | "
+                f"{(r.get('display_name') or '')[:80]}"
+            )
+    # ── END DEBUG ─────────────────────────────────────────────────
 
     results.sort(key=lambda r: not looksLikeCampus(r))
     edu_hits = [r for r in results if looksLikeCampus(r)]
@@ -694,7 +686,17 @@ def findCampus(name, _status=None):
                     edu_hits = altEduHits
                     results = altResults
             except Exception:
-                pass  # if the alternate attempt fails for any reason, fall through to the honest error below
+                pass
+
+    if not edu_hits:
+        # Last-ditch: if the query itself contains an education keyword but
+        # none of the Nominatim results matched our classifier, accept the
+        # top result anyway rather than showing a hard failure -- the user
+        # knows what they searched for.
+        name_lower = name.lower()
+        query_looks_educational = any(hint in name_lower for hint in campusNameHints)
+        if query_looks_educational and results:
+            edu_hits = results[:1]
 
     if not edu_hits:
         raise ValueError(
@@ -720,10 +722,6 @@ def findCampus(name, _status=None):
     top_hit = edu_hits[0]
     hitName = top_hit.get("display_name", name)
 
-    # Prefer a direct OSM-ID lookup over re-searching by name: it's the exact
-    # same place we already matched, hits Nominatim's lighter "lookup"
-    # endpoint instead of a fresh fuzzy "search", and avoids burning a second
-    # full search request against an already-strained rate limit.
     osmType = top_hit.get("osm_type")
     osmId = top_hit.get("osm_id")
     typePrefix = {"node": "N", "way": "W", "relation": "R"}.get(osmType)
@@ -740,13 +738,6 @@ def findCampus(name, _status=None):
         boundaryErr = e
 
     if boundaryErr is not None or gdf is None or gdf.empty or gdf.iloc[0].geometry.geom_type not in ("Polygon", "MultiPolygon"):
-        # the precise boundary lookup failed or came back unusable -- rather
-        # than a hard failure, fall back to the bounding box the search step
-        # already gave us for free (Nominatim includes one on every result,
-        # no extra request needed). It's a rectangle, not the campus's real
-        # outline, so it's a genuine downgrade -- but a slightly-imprecise
-        # working map beats no map, especially when the reason we're here is
-        # that a second network request just got rate-limited.
         bbox = top_hit.get("boundingbox")
         if bbox and len(bbox) == 4:
             try:
@@ -778,35 +769,32 @@ findCampus = st.cache_data(show_spinner=False, ttl="24h")(findCampus)
 
 
 def prepareCampusData(polygon_wkt, active_layers, status):
-    """Fetch + shape everything the map needs. Pure data, no folium objects --
-    this is the only part that's slow (network calls), and it's cached by
-    fetchRoadsAndWalkways / fetchBuildingsAndFacilities so it only runs once
-    per campus, not on every sidebar interaction."""
     from shapely import wkt as swkt
     poly = swkt.loads(polygon_wkt)
     minx, miny, maxx, maxy = poly.bounds
 
     layerData = {}
-    namedRoads = {}
-    namedRoadGeo = {}
 
-    # NOTE: always fetch + store BOTH members of each pair, regardless of which
-    # boxes are checked right now. The Overpass query already pulls both
-    # members together (it's one combined query), so this costs nothing extra
-    # over the network -- and it's the fix for sidebar toggles doing nothing:
-    # previously the untouched half of a pair was fetched and immediately
-    # thrown away, so checking it later had no data to show without a full
-    # re-fetch. Now everything is kept, and which layers are actually drawn is
-    # decided fresh at render time from the live checkbox state.
     status.update(label="Fetching roads and pedestrian paths...")
-    roadGeo, walkGeo, namedRoads, namedRoadGeo = fetchRoadsAndWalkways(polygon_wkt)
+    try:
+        roadGeo, walkGeo, namedRoads, namedRoadGeo = fetchRoadsAndWalkways(polygon_wkt, _status=status)
+    except Exception as e:
+        raise ValueError(
+            f"Couldn't fetch road/path data from OpenStreetMap's Overpass service.\n\n{e}"
+        )
     layerData["roads"] = roadGeo
     layerData["walkways"] = walkGeo
     status.write(f"Roads: {len(roadGeo['features']) if roadGeo else 0} segments, "
                  f"Paths: {len(walkGeo['features']) if walkGeo else 0} segments")
 
     status.update(label="Fetching buildings and facilities...")
-    bldGdf, facGdf = fetchBuildingsAndFacilities(polygon_wkt)
+    try:
+        bldGdf, facGdf = fetchBuildingsAndFacilities(polygon_wkt, _status=status)
+    except Exception as e:
+        raise ValueError(
+            f"Couldn't fetch building data from OpenStreetMap's Overpass service.\n\n{e}"
+        )
+
     bldGdf = stripDuplicateBuildings(bldGdf, facGdf)
     layerData["buildings"] = _stripUnusedProps(_roundGeoJson(bldGdf.__geo_interface__)) if bldGdf is not None and not bldGdf.empty else None
     layerData["facilities"] = _stripUnusedProps(_roundGeoJson(facGdf.__geo_interface__)) if facGdf is not None and not facGdf.empty else None
@@ -831,9 +819,6 @@ def prepareCampusData(polygon_wkt, active_layers, status):
 
     status.write("Indexing named buildings and roads for search...")
 
-    # named-building index for the "Find a building" search -- real OSM names only,
-    # decorated with category so searching "library" or "cafe" surfaces matches
-    # even when the freshman doesn't know the specific building's name
     namedLocations = {}
     for gdf in (bldGdf, facGdf):
         if gdf is None or gdf.empty or "HasName" not in gdf.columns:
@@ -859,15 +844,14 @@ def prepareCampusData(polygon_wkt, active_layers, status):
 
 
 def addBranding(m):
-    # bottom-right: clear of the zoom control (top-left), Fullscreen button
-    # (top-right), and our own legend (bottom-left)
     branding_html = """
     {% macro html(this, kwargs) %}
     <div style="position: fixed; bottom: 10px; right: 10px; z-index: 9999;
-                background: white; padding: 8px 12px; border-radius: 4px;
-                box-shadow: 0 1px 4px rgba(0,0,0,0.3); font-size: 13px;
-                font-family: sans-serif; line-height: 1.4; color: #333;">
-        CampusWay
+                background: white; padding: 6px 12px; border-radius: 4px;
+                box-shadow: 0 1px 4px rgba(0,0,0,0.3); font-size: 12px;
+                font-family: -apple-system, sans-serif; font-weight: 600;
+                color: #333;">
+        Campus<span style="color:#C54C0A;">Way</span>
     </div>
     {% endmacro %}
     """
@@ -878,31 +862,28 @@ def addBranding(m):
 
 def renderCampusMap(layerData, counts, bounds, visibleLayers, focusName=None, focusLoc=None,
                      focusRoad=None, focusRoadBounds=None, focusRoadGeo=None):
-    """Builds a brand new folium map every call. Cheap: no network calls, just
-    re-attaches already-fetched GeoJSON. Building fresh (instead of mutating
-    a single map object stored across reruns) is what keeps this fast --
-    a reused, endlessly-mutated map object accumulates every fit_bounds/marker/
-    highlight ever added across the whole session and grinds the browser
-    to a halt after a few clicks.
-
-    visibleLayers is read fresh from the sidebar checkboxes on every single
-    call, so which layers actually get drawn always matches their current
-    state -- this is what makes the sidebar toggles work, since layerData
-    itself always contains everything that was ever fetched."""
     miny, minx, maxy, maxx = bounds
     cLat = (miny + maxy) / 2
     cLon = (minx + maxx) / 2
 
+    # Use explicit CARTO tile URL with API key instead of the named alias so
+    # the key parameter is included and the "API key required" watermark is
+    # removed. CartoDB.Positron (light_all) is visually identical to what the
+    # app used before -- the only change is the key in the URL.
     m = leafmap.Map(
         center=[cLat, cLon],
         zoom=15,
-        tiles="CartoDB.Positron",
-        prefer_canvas=True,   # canvas renderer instead of SVG -- much faster
-                               # with hundreds/thousands of building & road
-                               # shapes, which is exactly this app's workload
-        control_scale=True,   # small distance scale bar -- helps students
-                               # gauge how far a walk actually is
+        tiles=None,          # disable the default tile layer; we add ours below
+        prefer_canvas=True,
+        control_scale=True,
     )
+    folium.TileLayer(
+        tiles=CARTO_TILE_URL,
+        attr=CARTO_ATTRIBUTION,
+        name="CartoDB Positron",
+        subdomains=["a", "b", "c", "d"],
+        max_zoom=19,
+    ).add_to(m)
 
     folium_plugins.Fullscreen(
         position="topright",
@@ -911,17 +892,12 @@ def renderCampusMap(layerData, counts, bounds, visibleLayers, focusName=None, fo
         force_separate_button=True
     ).add_to(m)
 
-    # "show my location" -- uses the browser's own GPS/Wi-Fi location, no
-    # server round-trip, so it's essentially free and is the single most
-    # useful feature for a freshman who is actually lost on campus right now
     folium_plugins.LocateControl(
         position="topright",
         strings={"title": "Show my location"},
         flyTo=True,
     ).add_to(m)
 
-    # lets a student drag out a line/area on the map to see the real
-    # walking distance, e.g. "is it faster to cut through the quad?"
     folium_plugins.MeasureControl(
         position="topleft",
         primary_length_unit="meters",
@@ -940,9 +916,7 @@ def renderCampusMap(layerData, counts, bounds, visibleLayers, focusName=None, fo
             name=layer_labels[k],
             style_function=campusStyles[k],
             tooltip=makeTooltip(),
-            smooth_factor=1.5,  # a bit more render-time line simplification in
-                                 # Leaflet itself -- imperceptible at the zoom
-                                 # levels this app is used at, cheaper to draw
+            smooth_factor=1.5,
         ).add_to(m)
 
     rendered = [k for k in drawOrder if k in visibleLayers and counts.get(k, 0) > 0]
@@ -956,9 +930,10 @@ def renderCampusMap(layerData, counts, bounds, visibleLayers, focusName=None, fo
         legend_html = f"""
         {{% macro html(this, kwargs) %}}
         <div style="position: fixed; bottom: 30px; left: 10px; z-index: 9999;
-                    background: white; padding: 8px 12px; border-radius: 4px;
-                    box-shadow: 0 1px 4px rgba(0,0,0,0.3); font-size: 13px;
-                    font-family: sans-serif; line-height: 1.4;">
+                    background: #FFFFFF; padding: 8px 12px; border-radius: 3px;
+                    box-shadow: 0 1px 4px rgba(0,0,0,0.3); font-size: 12.5px;
+                    font-family: -apple-system, sans-serif; line-height: 1.5;
+                    border-top: 3px solid #16233B;">
             {rows}
         </div>
         {{% endmacro %}}
@@ -976,10 +951,10 @@ def renderCampusMap(layerData, counts, bounds, visibleLayers, focusName=None, fo
         folium.CircleMarker(
             location=[flat, flon],
             radius=16,
-            color="#ff6600",
+            color="#C54C0A",
             weight=3,
             fill=True,
-            fill_color="#ff6600",
+            fill_color="#C54C0A",
             fill_opacity=0.15,
             tooltip=folium.Tooltip(focusName),
         ).add_to(m)
@@ -993,7 +968,7 @@ def renderCampusMap(layerData, counts, bounds, visibleLayers, focusName=None, fo
                 data=focusRoadGeo,
                 name="__highlight__",
                 style_function=lambda feat: {
-                    "color": "#ff6600",
+                    "color": "#C54C0A",
                     "weight": 6,
                     "opacity": 0.9,
                 },
@@ -1003,6 +978,51 @@ def renderCampusMap(layerData, counts, bounds, visibleLayers, focusName=None, fo
         m.fit_bounds([[miny, minx], [maxy, maxx]])
 
     return m
+
+
+# ── visual identity ──────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@700;800&family=IBM+Plex+Mono:wght@500&display=swap');
+
+:root {
+    --cw-ink: #16233B;
+    --cw-accent: #C54C0A;
+    --cw-accent-hover: #A23E08;
+    --cw-muted: #5B6472;
+}
+
+.stButton button[kind="primary"] {
+    background: var(--cw-accent) !important;
+    border-color: var(--cw-accent) !important;
+}
+.stButton button[kind="primary"]:hover {
+    background: var(--cw-accent-hover) !important;
+    border-color: var(--cw-accent-hover) !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown("""
+<div style="display:flex; align-items:center; gap:0.85rem;
+            padding: 0.4rem 0 1.1rem 0; border-bottom: 2px solid #E5E5E0;
+            margin-bottom: 1.1rem;">
+    <div style="width:40px; height:40px; flex-shrink:0; background: var(--cw-ink);
+                border-radius:6px; display:flex; align-items:center; justify-content:center;">
+        <span style="font-size:1.25rem; line-height:1;">🧭</span>
+    </div>
+    <div>
+        <div style="font-family:'Barlow Condensed', sans-serif; font-weight:800;
+                    font-size:1.7rem; line-height:1; color: var(--cw-ink);">
+            CAMPUS<span style="color: var(--cw-accent);">WAY</span>
+        </div>
+        <div style="font-family:'IBM Plex Mono', monospace; font-size:0.75rem;
+                    color: var(--cw-muted); margin-top:3px;">
+            Wayfinding for any campus, anywhere
+        </div>
+    </div>
+</div>
+""", unsafe_allow_html=True)
 
 
 # ── sidebar ──────────────────────────────────────────────────────────────────
@@ -1069,7 +1089,7 @@ with st.sidebar:
             if matches:
                 for m in matches:
                     kind = allNames[m]
-                    icon = ""
+                    icon = "🏢" if kind == "building" else "🛣️"
                     if st.button(f"{icon} {m}", key=f"quick_pick_{kind}_{m}", use_container_width=True):
                         if kind == "building":
                             st.session_state["building_select"] = m
@@ -1157,7 +1177,7 @@ if "campusData" not in st.session_state:
                 st.session_state["namedRoadGeo"] = namedRoadGeo
                 status.update(label=f"Map ready - {campusName}", state="complete", expanded=False)
             except ValueError as e:
-                status.update(label="No OSM data found", state="error")
+                status.update(label="Couldn't build the map", state="error")
                 err = ("warning", str(e))
             except Exception as e:
                 status.update(label="Map build failed", state="error")
@@ -1171,10 +1191,6 @@ if "campusData" not in st.session_state:
             st.warning(msg)
         st.stop()
 
-    # force an immediate follow-up rerun so the sidebar picks up the freshly
-    # populated namedLocations/namedRoads on its next execution -- otherwise the
-    # "Find a building"/"Find a road" dropdowns wouldn't appear until some
-    # unrelated later interaction happened to trigger another rerun
     st.rerun()
 
 campusData = st.session_state["campusData"]
@@ -1193,9 +1209,6 @@ if focusRoad and focusRoad in st.session_state.get("namedRoads", {}):
 else:
     focusRoad = None
 
-# a brand new map is built on every run instead of reusing/mutating one
-# stored object -- that's what keeps this fast and keeps focus/highlight
-# state correct no matter which building or road was picked last
 campusMap = renderCampusMap(
     campusData["layerData"],
     campusData["counts"],
@@ -1214,4 +1227,4 @@ if focusName and focusLoc:
     nearby = nearbyLocations(focusLoc, focusName, st.session_state.get("namedLocations", {}))
     if nearby:
         chips = " · ".join(f"{n} ({int(round(d))}m)" for n, d in nearby)
-        st.caption(f"Near **{focusName}**: {chips}")
+        st.caption(f"🧭 Near **{focusName}**: {chips}")
