@@ -10,6 +10,7 @@ st.set_page_config(
 import time
 import html
 import re
+import threading
 import requests
 from collections import deque
 import pandas as pd
@@ -20,6 +21,8 @@ from shapely.geometry import shape, box as shapelyBox
 from folium import plugins as folium_plugins
 import leafmap.foliumap as leafmap
 import osmnx as ox
+
+BUILD_MARKER = "diag-2026-09-12-07-retryfix"
 
 
 MAX_FEATURES_PER_LAYER = 6000
@@ -99,9 +102,46 @@ req_headers = {"User-Agent": "global-campus-navigator/1.0 (streamlit-app)"}
 RATE_LIMIT_GAP = 1.5
 
 
+def runWithDeadline(fn, args, seconds, label):
+    """
+    Run fn(*args) in a background thread and give up after `seconds`,
+    regardless of what fn is actually doing (blocked socket read, DNS
+    resolution hang, a dependency ignoring its own timeout, etc).
+
+    IMPORTANT: this deliberately does NOT use ThreadPoolExecutor as a
+    `with` block. `with ThreadPoolExecutor() as pool:` calls
+    pool.shutdown(wait=True) on exit -- which BLOCKS until the background
+    thread actually finishes, even if future.result(timeout=...) already
+    raised. That silently defeated the entire point of a deadline: the
+    caller would still hang for however long the real call took, just
+    with an extra exception swallowed at the end. Calling shutdown(wait=False)
+    explicitly lets the calling thread return immediately once the deadline
+    hits; the orphaned worker thread finishes on its own and its result
+    (or exception) is simply discarded.
+    """
+    import concurrent.futures
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = pool.submit(fn, *args)
+    try:
+        result = future.result(timeout=seconds)
+        pool.shutdown(wait=False)
+        return result
+    except concurrent.futures.TimeoutError:
+        pool.shutdown(wait=False)  # do NOT wait -- this is the actual fix
+        raise TimeoutError(
+            f"{label} took longer than {seconds}s and was cancelled. "
+            f"OpenStreetMap's free services can be slow or unreachable "
+            f"depending on network conditions -- try again in a moment."
+        )
+    except Exception:
+        pool.shutdown(wait=False)
+        raise
+
+
 OVERPASS_MIRRORS = [
     "https://overpass-api.de/api",
     "https://overpass.kumi.systems/api",
+    "https://overpass.private.coffee/api",
 ]
 
 
@@ -109,17 +149,20 @@ OVERPASS_MIRRORS = [
 def initOsmnx():
     ox.settings.use_cache = True
     ox.settings.log_console = False
-    ox.settings.requests_timeout = 20
+    ox.settings.requests_timeout = 25
     ox.settings.overpass_url = OVERPASS_MIRRORS[0]
     return True
 
 
-def fetchFromOverpass(fetchFn, *args, _status=None):
+def fetchFromOverpass(fetchFn, *args):
+    # No _status param: called from inside st.cache_data functions where
+    # writing to Streamlit widgets is forbidden and causes the cached-replay crash.
+    # Try each mirror ONCE -- no retry-with-sleep here. Retrying each mirror
+    # multiple times with long timeouts previously multiplied worst-case wait
+    # to several minutes per call, which is indistinguishable from "stuck" to
+    # a user. The hard deadline in runWithDeadline() is the real safety net.
     lastErr = None
-    for i, mirror in enumerate(OVERPASS_MIRRORS):
-        if _status is not None:
-            word = "Trying" if i == 0 else "That was slow -- trying a backup"
-            _status.write(f"{word} OpenStreetMap server (up to {ox.settings.requests_timeout}s)...")
+    for mirror in OVERPASS_MIRRORS:
         ox.settings.overpass_url = mirror
         try:
             return fetchFn(*args)
@@ -135,12 +178,19 @@ def fetchFromOverpass(fetchFn, *args, _status=None):
     )
 
 
+_nomLastCallTime = [0.0]
+_nomLock = threading.Lock()
+
 def throttleNominatim():
-    t_last = st.session_state.get("nom_last", 0.0)
-    gap = RATE_LIMIT_GAP - (time.monotonic() - t_last)
-    if gap > 0:
-        time.sleep(gap)
-    st.session_state["nom_last"] = time.monotonic()
+    # Plain module-level state, NOT st.session_state: this function is called
+    # from inside a background thread (see runWithDeadline), and st.session_state
+    # requires Streamlit's script-run context which only exists on the main
+    # thread. Using session_state here was silently unreliable across threads.
+    with _nomLock:
+        gap = RATE_LIMIT_GAP - (time.monotonic() - _nomLastCallTime[0])
+        if gap > 0:
+            time.sleep(gap)
+        _nomLastCallTime[0] = time.monotonic()
 
 
 initOsmnx()
@@ -179,6 +229,14 @@ campusNameHints = (
     "mit.edu",
 )
 
+# "mit" (and to a lesser extent a few other short hints) is a substring of
+# many unrelated words -- "Admit", "Committee", "Summit", "Marriott" would
+# all incorrectly match with a plain "in" check. Word-boundary regexes make
+# these only match whole words/phrases instead of anywhere inside a word.
+_campusNameHintPatterns = [
+    re.compile(r"\b" + re.escape(h) + r"\b", re.IGNORECASE) for h in campusNameHints
+]
+
 
 def looksLikeCampus(nominatimResult):
     pair = (nominatimResult.get("class"), nominatimResult.get("type"))
@@ -192,7 +250,7 @@ def looksLikeCampus(nominatimResult):
     dn = nominatimResult.get("display_name") or ""
     if not isinstance(dn, str):
         dn = str(dn)
-    return any(hint in dn.lower() for hint in campusNameHints)
+    return any(p.search(dn) for p in _campusNameHintPatterns)
 
 
 PHOTON_URL = "https://photon.komoot.io/api/"
@@ -233,7 +291,7 @@ def queryPhoton(q, limit=5):
     return out
 
 
-def queryNominatim(q, limit=5, _status=None):
+def queryNominatim(q, limit=5):
     p = {
         "q": q,
         "format": "jsonv2",
@@ -272,8 +330,6 @@ def queryNominatim(q, limit=5, _status=None):
             wait = backoffs[min(attempt, len(backoffs) - 1)]
         wait = min(wait, 10)
 
-        if _status is not None:
-            _status.write(f"OpenStreetMap returned HTTP 429 -- retrying in {int(wait)}s...")
         time.sleep(wait)
 
     raise ValueError(
@@ -534,13 +590,28 @@ def _propagateRoadNames(features, maxHops=6):
     return effectiveName
 
 
-def fetchRoadsAndWalkways(polygon_wkt, _status=None):
+def fetchRoadsAndWalkways(polygon_wkt):
     from shapely import wkt as swkt
     poly = swkt.loads(polygon_wkt)
 
-    gdf = fetchFromOverpass(ox.features_from_polygon, poly, {"highway": WALKWAY_VALUES + ROAD_VALUES}, _status=_status)
+    # osmnx DOES support list values as OR filters (confirmed against docs) --
+    # scope this to only the highway types we display, rather than True
+    # (which pulls every highway type, including motorways/trunks/etc that
+    # get filtered right back out below -- unnecessarily slow for no benefit).
+    allowed = WALKWAY_VALUES + ROAD_VALUES
+    gdf = fetchFromOverpass(ox.features_from_polygon, poly, {"highway": allowed})
     if gdf is None or gdf.empty or "highway" not in gdf.columns:
-        return None, None, {}, {}
+        # Deliberately RAISE rather than return an empty result. This function
+        # is @st.cache_data-decorated by polygon -- a successful-but-empty
+        # return gets cached for 24h as "this campus permanently has no
+        # roads", even if the empty result was actually a transient Overpass
+        # hiccup (rate limit, momentary server issue, a big/complex query
+        # getting cut short). Raising means nothing gets cached, so a retry
+        # -- automatic or user-triggered -- can genuinely hit the network
+        # again instead of replaying a false negative for 24 hours.
+        raise RuntimeError(
+            "Overpass returned no road/path data for this area (possibly transient)"
+        )
     gdf = gdf.to_crs("EPSG:4326") if gdf.crs else gdf
     gdf = _simplify(gdf)
     gdf = _capFeatures(gdf)
@@ -586,17 +657,28 @@ def fetchRoadsAndWalkways(polygon_wkt, _status=None):
 fetchRoadsAndWalkways = st.cache_data(show_spinner=False, ttl="24h")(fetchRoadsAndWalkways)
 
 
-def fetchBuildingsAndFacilities(polygon_wkt, _status=None):
+def fetchBuildingsAndFacilities(polygon_wkt):
     from shapely import wkt as swkt
     poly = swkt.loads(polygon_wkt)
 
+    # osmnx DOES support list values as OR filters (confirmed against docs) --
+    # scope amenity/leisure to only the values we actually display, rather than
+    # True (which pulls down every amenity of any kind -- benches, waste
+    # baskets, vending machines, etc -- across the whole campus and is much
+    # slower for large campuses like MIT for no benefit, since we filter it
+    # right back down below anyway).
     gdf = fetchFromOverpass(ox.features_from_polygon, poly, {
         "building": True,
         "amenity": FACILITY_AMENITY_VALUES,
         "leisure": FACILITY_LEISURE_VALUES,
-    }, _status=_status)
+    })
     if gdf is None or gdf.empty:
-        return None, None
+        # See fetchRoadsAndWalkways for why this raises instead of returning
+        # an empty result -- avoids permanently caching a transient failure
+        # as "this campus has no buildings" for 24h.
+        raise RuntimeError(
+            "Overpass returned no building data for this area (possibly transient)"
+        )
     gdf = gdf.to_crs("EPSG:4326") if gdf.crs else gdf
     gdf = _simplify(gdf)
     gdf = _capFeatures(gdf)
@@ -645,12 +727,10 @@ def _alternateNameGuess(name):
     return f"{rest.strip()} {kind.title()}"
 
 
-def findCampus(name, _status=None):
+def findCampus(name):
     try:
-        results = queryNominatim(name, _status=_status)
+        results = queryNominatim(name)
     except ValueError as nomErr:
-        if _status is not None:
-            _status.write("OpenStreetMap search is unavailable -- trying a backup search service...")
         try:
             results = queryPhoton(name)
         except Exception:
@@ -659,19 +739,6 @@ def findCampus(name, _status=None):
     if not results:
         raise ValueError(f'No results found for **"{name}"** on OpenStreetMap.\n\nTry a more specific name, e.g. `"{name}, City, Country"`')
 
-    # ── DEBUG: show raw Nominatim results so we can see exactly why
-    # the classifier is or isn't matching ──────────────────────────
-    if _status is not None:
-        _status.write(f"**Debug — raw results ({len(results)}):**")
-        for i, r in enumerate(results):
-            _status.write(
-                f"  [{i}] class={r.get('class')!r} category={r.get('category')!r} "
-                f"type={r.get('type')!r} osm_type={r.get('osm_type')!r} "
-                f"passes={looksLikeCampus(r)} | "
-                f"{(r.get('display_name') or '')[:80]}"
-            )
-    # ── END DEBUG ─────────────────────────────────────────────────
-
     results.sort(key=lambda r: not looksLikeCampus(r))
     edu_hits = [r for r in results if looksLikeCampus(r)]
 
@@ -679,7 +746,7 @@ def findCampus(name, _status=None):
         alt = _alternateNameGuess(name)
         if alt:
             try:
-                altResults = queryNominatim(alt, _status=_status)
+                altResults = queryNominatim(alt)
                 altResults.sort(key=lambda r: not looksLikeCampus(r))
                 altEduHits = [r for r in altResults if looksLikeCampus(r)]
                 if altEduHits:
@@ -694,7 +761,7 @@ def findCampus(name, _status=None):
         # top result anyway rather than showing a hard failure -- the user
         # knows what they searched for.
         name_lower = name.lower()
-        query_looks_educational = any(hint in name_lower for hint in campusNameHints)
+        query_looks_educational = any(p.search(name_lower) for p in _campusNameHintPatterns)
         if query_looks_educational and results:
             edu_hits = results[:1]
 
@@ -719,53 +786,90 @@ def findCampus(name, _status=None):
         except Exception:
             continue
 
-    top_hit = edu_hits[0]
+    # No hit had a usable polygon. Before falling back to a raw bounding box,
+    # prefer a "relation" or "way" hit over a bare "node" (point) -- a node's
+    # Nominatim bbox is tiny (tens of meters), which for a real campus almost
+    # always misses every actual building/road, silently producing "no data"
+    # even though OSM has plenty of data for the school. Prefer whichever hit
+    # has the largest bbox area as a proxy for "most likely a real boundary".
+    def _bboxArea(hit):
+        bbox = hit.get("boundingbox")
+        if not bbox or len(bbox) != 4:
+            return 0.0
+        try:
+            south, north, west, east = (float(v) for v in bbox)
+            return max(0.0, north - south) * max(0.0, east - west)
+        except Exception:
+            return 0.0
+
+    typeRank = {"relation": 0, "way": 1, "node": 2}
+    ranked = sorted(
+        edu_hits,
+        key=lambda h: (typeRank.get(h.get("osm_type"), 3), -_bboxArea(h))
+    )
+    top_hit = ranked[0]
     hitName = top_hit.get("display_name", name)
 
-    osmType = top_hit.get("osm_type")
-    osmId = top_hit.get("osm_id")
-    typePrefix = {"node": "N", "way": "W", "relation": "R"}.get(osmType)
+    MIN_SPAN_DEG = 0.0018  # ~200m at mid latitudes, so ~400m box
 
-    gdf = None
-    boundaryErr = None
-    try:
-        throttleNominatim()
-        if typePrefix and osmId:
-            gdf = ox.geocode_to_gdf(f"{typePrefix}{osmId}", by_osmid=True)
-        else:
-            gdf = ox.geocode_to_gdf(hitName)
-    except Exception as e:
-        boundaryErr = e
+    bbox = top_hit.get("boundingbox")
+    if bbox and len(bbox) == 4:
+        try:
+            south, north, west, east = (float(v) for v in bbox)
+            # A bare node's bbox is a tiny square around one point -- pad it
+            # out to a sane minimum footprint (roughly 400m x 400m) so the
+            # Overpass query has a real chance of catching nearby campus
+            # buildings/roads instead of guaranteed-empty results.
+            if (north - south) < MIN_SPAN_DEG or (east - west) < MIN_SPAN_DEG:
+                cy, cx = (north + south) / 2, (east + west) / 2
+                south, north = cy - MIN_SPAN_DEG, cy + MIN_SPAN_DEG
+                west, east = cx - MIN_SPAN_DEG, cx + MIN_SPAN_DEG
+            g = shapelyBox(west, south, east, north)
+            return hitName, g.wkt
+        except Exception:
+            pass
 
-    if boundaryErr is not None or gdf is None or gdf.empty or gdf.iloc[0].geometry.geom_type not in ("Polygon", "MultiPolygon"):
-        bbox = top_hit.get("boundingbox")
-        if bbox and len(bbox) == 4:
-            try:
-                south, north, west, east = (float(v) for v in bbox)
-                g = shapelyBox(west, south, east, north)
-                if _status is not None:
-                    _status.write(f"Using an approximate boundary for {hitName} -- the precise outline "
-                                   f"was temporarily unavailable.")
-                return hitName, g.wkt
-            except Exception:
-                pass
+    # No boundingbox at all -- this is the common case for Photon-sourced
+    # results (queryPhoton only sets boundingbox when the source feature has
+    # an "extent", which point-type results usually lack). Photon and
+    # Nominatim both always provide lat/lon though, so build a padded box
+    # around the point instead of giving up entirely.
+    lat, lon = top_hit.get("lat"), top_hit.get("lon")
+    if lat is not None and lon is not None:
+        try:
+            lat, lon = float(lat), float(lon)
+            g = shapelyBox(lon - MIN_SPAN_DEG, lat - MIN_SPAN_DEG,
+                            lon + MIN_SPAN_DEG, lat + MIN_SPAN_DEG)
+            return hitName, g.wkt
+        except Exception:
+            pass
 
-        if boundaryErr is not None:
-            raise ValueError(
-                f'Found **"{hitName}"** but could not get its precise boundary, and no '
-                f'fallback bounding box was available either.\n\n'
-                f'Raw error: `{boundaryErr}`'
-            )
-        raise ValueError(
-            f'**"{hitName}"** is in OSM but only as a point, not a boundary polygon.\n\n'
-            f'Try a more specific search or check [openstreetmap.org](https://www.openstreetmap.org).'
-        )
-
-    g = gdf.iloc[0].geometry
-    if not g.is_valid:
-        g = g.buffer(0)
-    return hitName, g.wkt
+    raise ValueError(
+        f'**"{hitName}"** was found but has no boundary polygon, bounding box, or even '
+        f'coordinates on OpenStreetMap.\n\n'
+        f'Try a more specific search or check [openstreetmap.org](https://www.openstreetmap.org).'
+    )
 findCampus = st.cache_data(show_spinner=False, ttl="24h")(findCampus)
+
+
+def _fetchWithRetry(fn, args, deadline_seconds, label, status):
+    """
+    Try fn(*args) under a hard deadline; on failure, wait briefly and try
+    ONE more time (fresh -- these fetch functions now raise rather than
+    cache empty results, so a retry genuinely hits the network again, not
+    a cached false negative). Returns (result, lastError). Bounded to 2
+    attempts total so worst case is ~2x deadline_seconds, not unbounded.
+    """
+    lastErr = None
+    for attempt in range(2):
+        try:
+            return runWithDeadline(fn, args, deadline_seconds, label), None
+        except Exception as e:
+            lastErr = e
+            if attempt == 0:
+                status.write(f"⏳ {label} came back empty/failed once, retrying...")
+                time.sleep(2)
+    return None, lastErr
 
 
 def prepareCampusData(polygon_wkt, active_layers, status):
@@ -776,24 +880,28 @@ def prepareCampusData(polygon_wkt, active_layers, status):
     layerData = {}
 
     status.update(label="Fetching roads and pedestrian paths...")
-    try:
-        roadGeo, walkGeo, namedRoads, namedRoadGeo = fetchRoadsAndWalkways(polygon_wkt, _status=status)
-    except Exception as e:
-        raise ValueError(
-            f"Couldn't fetch road/path data from OpenStreetMap's Overpass service.\n\n{e}"
-        )
+    roadGeo, walkGeo, namedRoads, namedRoadGeo = None, None, {}, {}
+    roadResult, roadErr = _fetchWithRetry(
+        fetchRoadsAndWalkways, (polygon_wkt,), 45, "Road/path fetch", status
+    )
+    if roadResult is not None:
+        roadGeo, walkGeo, namedRoads, namedRoadGeo = roadResult
+        status.write(f"Roads: {len(roadGeo['features']) if roadGeo else 0} segments, "
+                     f"Paths: {len(walkGeo['features']) if walkGeo else 0} segments")
+    else:
+        status.write(f"⚠️ Road/path data unavailable after retry ({roadErr}) — continuing with buildings only.")
     layerData["roads"] = roadGeo
     layerData["walkways"] = walkGeo
-    status.write(f"Roads: {len(roadGeo['features']) if roadGeo else 0} segments, "
-                 f"Paths: {len(walkGeo['features']) if walkGeo else 0} segments")
 
     status.update(label="Fetching buildings and facilities...")
-    try:
-        bldGdf, facGdf = fetchBuildingsAndFacilities(polygon_wkt, _status=status)
-    except Exception as e:
-        raise ValueError(
-            f"Couldn't fetch building data from OpenStreetMap's Overpass service.\n\n{e}"
-        )
+    bldGdf, facGdf = None, None
+    buildResult, buildErr = _fetchWithRetry(
+        fetchBuildingsAndFacilities, (polygon_wkt,), 45, "Building fetch", status
+    )
+    if buildResult is not None:
+        bldGdf, facGdf = buildResult
+    else:
+        status.write(f"⚠️ Building data unavailable after retry ({buildErr}) — continuing with roads/paths only.")
 
     bldGdf = stripDuplicateBuildings(bldGdf, facGdf)
     layerData["buildings"] = _stripUnusedProps(_roundGeoJson(bldGdf.__geo_interface__)) if bldGdf is not None and not bldGdf.empty else None
@@ -815,7 +923,23 @@ def prepareCampusData(polygon_wkt, active_layers, status):
         foundAnything = True
 
     if not foundAnything:
-        raise ValueError("OSM has no tagged data for this campus. Try a different campus or check openstreetmap.org.")
+        area_deg2 = (maxx - minx) * (maxy - miny)
+        reasons = []
+        if roadErr is not None:
+            reasons.append(f"roads/paths: {roadErr}")
+        if buildErr is not None:
+            reasons.append(f"buildings: {buildErr}")
+        reasonText = " | ".join(reasons) if reasons else "no specific error was raised, both fetches simply returned empty"
+        raise ValueError(
+            f"OSM has no roads, paths, buildings, or facilities tagged inside the matched "
+            f"boundary for this campus after retrying (searched area: roughly "
+            f"{minx:.4f},{miny:.4f} to {maxx:.4f},{maxy:.4f}, ~{area_deg2*111*111:.2f} km²).\n\n"
+            f"Underlying reason(s): {reasonText}\n\n"
+            f"This usually means either OpenStreetMap's Overpass service was temporarily "
+            f"overloaded (try again in a minute) or the matched boundary is a point/wrong "
+            f"area rather than the actual campus footprint. Try adding the city and state, "
+            f"or check the name on openstreetmap.org."
+        )
 
     status.write("Indexing named buildings and roads for search...")
 
@@ -1030,6 +1154,31 @@ st.markdown("""
 use_facilities = True
 
 with st.sidebar:
+    st.caption(f"build: {BUILD_MARKER}")
+
+    with st.expander("🔧 Network diagnostic (isolated test)"):
+        st.caption(
+            "This bypasses ALL app logic and makes ONE direct request to "
+            "Nominatim with a 10s timeout. If this hangs or errors, the "
+            "problem is network/deployment-level, not this app's code."
+        )
+        if st.button("Run isolated network test"):
+            diagStart = time.time()
+            try:
+                diagResp = requests.get(
+                    "https://nominatim.openstreetmap.org/search",
+                    params={"q": "MIT", "format": "jsonv2", "limit": 1},
+                    headers={"User-Agent": "campusway-diagnostic/1.0"},
+                    timeout=10,
+                )
+                diagElapsed = time.time() - diagStart
+                st.success(f"HTTP {diagResp.status_code} in {diagElapsed:.1f}s")
+                st.json(diagResp.json()[:1] if diagResp.ok else diagResp.text[:500])
+            except Exception as e:
+                diagElapsed = time.time() - diagStart
+                st.error(f"FAILED after {diagElapsed:.1f}s: {type(e).__name__}: {e}")
+
+    st.divider()
     st.subheader("Search")
     campusInput = st.text_input(
         "University or college name",
@@ -1148,9 +1297,12 @@ if "campusData" not in st.session_state:
     err = None
     with st.status(f'Looking up "{searchTerm}"... (large campuses can take 30-60s)', expanded=True) as status:
         try:
-            campusName, campusPoly = findCampus(searchTerm, _status=status)
+            campusName, campusPoly = runWithDeadline(findCampus, (searchTerm,), 60, "Campus lookup")
             status.update(label=f"Found: {campusName}", state="running")
             status.write(f"Matched: {campusName}")
+        except TimeoutError as e:
+            status.update(label="Timed out", state="error")
+            err = ("error", str(e))
         except ValueError as e:
             status.update(label="Could not find campus", state="error")
             err = ("error", str(e))
