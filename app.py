@@ -11,6 +11,7 @@ import time
 import html
 import re
 import threading
+import random
 import requests
 from collections import deque
 import pandas as pd
@@ -22,7 +23,7 @@ from folium import plugins as folium_plugins
 import leafmap.foliumap as leafmap
 import osmnx as ox
 
-BUILD_MARKER = "diag-2026-09-12-07-retryfix"
+BUILD_MARKER = "diag-2026-09-13-10-parallel-timed"
 
 
 MAX_FEATURES_PER_LAYER = 6000
@@ -149,9 +150,21 @@ OVERPASS_MIRRORS = [
 def initOsmnx():
     ox.settings.use_cache = True
     ox.settings.log_console = False
-    ox.settings.requests_timeout = 25
+    # 13s per mirror x 3 mirrors = 39s worst case, comfortably inside the
+    # 45s external deadline in _fetchJob. The PREVIOUS value (25s) meant a
+    # single slow mirror could burn through most of the external deadline by
+    # itself, getting killed mid-attempt on mirror #2 before ever reaching
+    # mirror #3 -- then the retry would restart from mirror #1 again (the
+    # same slow one), repeating the same wasted time. This is very likely
+    # the real cause of the wildly inconsistent load times (30s-102s) rather
+    # than query complexity: a lucky first mirror = fast, an unlucky one =
+    # a wasted near-timeout followed by a full restart.
+    ox.settings.requests_timeout = 13
     ox.settings.overpass_url = OVERPASS_MIRRORS[0]
     return True
+
+
+_overpassSettingsLock = threading.Lock()
 
 
 def fetchFromOverpass(fetchFn, *args):
@@ -161,15 +174,35 @@ def fetchFromOverpass(fetchFn, *args):
     # multiple times with long timeouts previously multiplied worst-case wait
     # to several minutes per call, which is indistinguishable from "stuck" to
     # a user. The hard deadline in runWithDeadline() is the real safety net.
+    #
+    # Mirrors are shuffled per call (not always starting at mirrors[0]) so a
+    # temporarily overloaded "first" mirror doesn't get hit first on every
+    # single request from every user -- spreads load, improves the odds any
+    # given call lands on a healthy mirror immediately.
+    #
+    # ox.settings.overpass_url is a SHARED GLOBAL, and roads/buildings now
+    # fetch concurrently in two threads. Without a lock, thread A could set
+    # the mirror, then thread B overwrites it before thread A's actual HTTP
+    # call reads it -- A silently ends up hitting a mirror it never chose.
+    # The lock makes "pick a mirror, then make the full request" one atomic
+    # unit, so the two concurrent fetches never stomp on each other's
+    # mirror selection (this does mean the two Overpass network calls
+    # themselves are serialized relative to each other, but each one still
+    # overlaps with the OTHER thread's local post-processing/simplification
+    # work, which is not nothing).
+    mirrors = list(OVERPASS_MIRRORS)
+    random.shuffle(mirrors)
     lastErr = None
-    for mirror in OVERPASS_MIRRORS:
-        ox.settings.overpass_url = mirror
-        try:
-            return fetchFn(*args)
-        except Exception as e:
-            lastErr = e
-            continue
-    ox.settings.overpass_url = OVERPASS_MIRRORS[0]
+    for mirror in mirrors:
+        with _overpassSettingsLock:
+            ox.settings.overpass_url = mirror
+            try:
+                return fetchFn(*args)
+            except Exception as e:
+                lastErr = e
+                continue
+    with _overpassSettingsLock:
+        ox.settings.overpass_url = OVERPASS_MIRRORS[0]
     raise RuntimeError(
         f"OpenStreetMap's Overpass data service didn't respond after trying "
         f"{len(OVERPASS_MIRRORS)} server(s). This is a shared free service and "
@@ -852,38 +885,66 @@ def findCampus(name):
 findCampus = st.cache_data(show_spinner=False, ttl="24h")(findCampus)
 
 
-def _fetchWithRetry(fn, args, deadline_seconds, label, status):
+def _fetchJob(fn, args, deadline_seconds, label):
     """
-    Try fn(*args) under a hard deadline; on failure, wait briefly and try
-    ONE more time (fresh -- these fetch functions now raise rather than
-    cache empty results, so a retry genuinely hits the network again, not
-    a cached false negative). Returns (result, lastError). Bounded to 2
-    attempts total so worst case is ~2x deadline_seconds, not unbounded.
+    Pure data function, NO Streamlit calls -- safe to run inside a worker
+    thread (unlike status.write, which needs the main-thread script-run
+    context). Try fn(*args) under a hard deadline; on failure, wait briefly
+    and try ONE more time fresh (these fetch functions raise rather than
+    cache empty results, so a retry genuinely hits the network again).
+    Returns (result, lastError, didRetry, elapsedSeconds). Elapsed time is
+    measured from inside this worker thread itself, not inferred from when
+    the main thread happens to call .result() -- two jobs running
+    concurrently can finish in either order, and timing them via sequential
+    .result() calls on the main thread would misreport whichever one
+    finishes second as having taken as long as both combined.
     """
+    _t0 = time.time()
     lastErr = None
     for attempt in range(2):
         try:
-            return runWithDeadline(fn, args, deadline_seconds, label), None
+            result = runWithDeadline(fn, args, deadline_seconds, label)
+            return result, None, attempt > 0, time.time() - _t0
         except Exception as e:
             lastErr = e
             if attempt == 0:
-                status.write(f"⏳ {label} came back empty/failed once, retrying...")
-                time.sleep(2)
-    return None, lastErr
+                time.sleep(1)
+    return None, lastErr, True, time.time() - _t0
 
 
 def prepareCampusData(polygon_wkt, active_layers, status):
     from shapely import wkt as swkt
+    import concurrent.futures
     poly = swkt.loads(polygon_wkt)
     minx, miny, maxx, maxy = poly.bounds
 
     layerData = {}
 
-    status.update(label="Fetching roads and pedestrian paths...")
-    roadGeo, walkGeo, namedRoads, namedRoadGeo = None, None, {}, {}
-    roadResult, roadErr = _fetchWithRetry(
-        fetchRoadsAndWalkways, (polygon_wkt,), 45, "Road/path fetch", status
+    # Back to CONCURRENT fetching -- restoring full speed. The previous
+    # "make it sequential" change was based on an unverified theory about
+    # Overpass's per-IP concurrent-slot limit, and there's no way to confirm
+    # or rule that out without seeing real timing data from an actual slow
+    # run. Instead of trading away speed on a guess, this now times every
+    # stage explicitly and reports it in the status box, so the next slow
+    # run produces hard numbers (which exact stage is slow, and by how much)
+    # instead of more speculation.
+    t0 = time.time()
+    status.update(label="Fetching roads, paths, buildings, and facilities...")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        roadFuture = pool.submit(_fetchJob, fetchRoadsAndWalkways, (polygon_wkt,), 45, "Road/path fetch")
+        buildFuture = pool.submit(_fetchJob, fetchBuildingsAndFacilities, (polygon_wkt,), 45, "Building fetch")
+        roadResult, roadErr, roadRetried, roadElapsed = roadFuture.result()
+        buildResult, buildErr, buildRetried, buildElapsed = buildFuture.result()
+
+    status.write(
+        f"⏱️ Roads/paths took {roadElapsed:.1f}s"
+        + (" (needed a retry)" if roadRetried else "")
+        + f" | Buildings/facilities took {buildElapsed:.1f}s"
+        + (" (needed a retry)" if buildRetried else "")
+        + " — both ran concurrently, so wall-clock time is roughly the SLOWER of the two, not the sum."
     )
+
+    roadGeo, walkGeo, namedRoads, namedRoadGeo = None, None, {}, {}
     if roadResult is not None:
         roadGeo, walkGeo, namedRoads, namedRoadGeo = roadResult
         status.write(f"Roads: {len(roadGeo['features']) if roadGeo else 0} segments, "
@@ -893,11 +954,7 @@ def prepareCampusData(polygon_wkt, active_layers, status):
     layerData["roads"] = roadGeo
     layerData["walkways"] = walkGeo
 
-    status.update(label="Fetching buildings and facilities...")
     bldGdf, facGdf = None, None
-    buildResult, buildErr = _fetchWithRetry(
-        fetchBuildingsAndFacilities, (polygon_wkt,), 45, "Building fetch", status
-    )
     if buildResult is not None:
         bldGdf, facGdf = buildResult
     else:
@@ -908,6 +965,7 @@ def prepareCampusData(polygon_wkt, active_layers, status):
     layerData["facilities"] = _stripUnusedProps(_roundGeoJson(facGdf.__geo_interface__)) if facGdf is not None and not facGdf.empty else None
     status.write(f"Buildings: {len(bldGdf) if bldGdf is not None else 0}, "
                  f"Facilities: {len(facGdf) if facGdf is not None else 0}")
+    status.write(f"⏱️ Total data fetch: {time.time() - t0:.1f}s")
 
     drawOrder = ["roads", "walkways", "buildings", "facilities"]
     counts = {}
@@ -1295,11 +1353,14 @@ if not searchTerm:
 
 if "campusData" not in st.session_state:
     err = None
+    _searchStartTime = time.time()
     with st.status(f'Looking up "{searchTerm}"... (large campuses can take 30-60s)', expanded=True) as status:
         try:
+            _geoStart = time.time()
             campusName, campusPoly = runWithDeadline(findCampus, (searchTerm,), 60, "Campus lookup")
             status.update(label=f"Found: {campusName}", state="running")
             status.write(f"Matched: {campusName}")
+            status.write(f"⏱️ Geocoding took {time.time() - _geoStart:.1f}s")
         except TimeoutError as e:
             status.update(label="Timed out", state="error")
             err = ("error", str(e))
@@ -1327,6 +1388,7 @@ if "campusData" not in st.session_state:
                 st.session_state["namedLocations"] = namedLocations
                 st.session_state["namedRoads"] = namedRoads
                 st.session_state["namedRoadGeo"] = namedRoadGeo
+                status.write(f"⏱️ **Grand total, click to map ready: {time.time() - _searchStartTime:.1f}s**")
                 status.update(label=f"Map ready - {campusName}", state="complete", expanded=False)
             except ValueError as e:
                 status.update(label="Couldn't build the map", state="error")
