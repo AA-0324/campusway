@@ -1252,3 +1252,5 @@ if focusName and focusLoc:
     if nearby:
         chips = " · ".join(f"{n} ({int(round(d))}m)" for n, d in nearby)
         st.caption(f"🧭 Near **{focusName}**: {chips}")
+
+# 
