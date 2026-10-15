@@ -1,5 +1,22 @@
-import streamlit as st
+import time
+import re
+import threading
+import random
+import math
+import concurrent.futures
+from collections import deque
 
+import requests
+import pandas as pd
+import streamlit as st
+import folium
+import osmnx as ox
+import leafmap.foliumap as leafmap
+from branca.element import MacroElement, Template
+from folium import plugins as folium_plugins
+from shapely.geometry import shape, box as shapelyBox
+
+# must come before any other st call
 st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
@@ -7,45 +24,32 @@ st.set_page_config(
     page_icon="🧭",
 )
 
-import time
-import re
-import threading
-import random
-import requests
-from collections import deque
-import pandas as pd
-import folium
-from branca.element import MacroElement, Template
-from shapely.geometry import shape, box as shapelyBox
-from folium import plugins as folium_plugins
-import leafmap.foliumap as leafmap
-import osmnx as ox
-
 BUILD_LABEL = "v2.6"
 
 MAX_FEATURES_PER_LAYER = 2500
+max_rows = MAX_FEATURES_PER_LAYER
 
 CARTO_KEY = "cb1_2ely_1_56403dce0becb94f8ac75d76"
 CARTO_TILE_URL = (
     f"https://{{s}}.basemaps.cartocdn.com/rastertiles/light_all/{{z}}/{{x}}/{{y}}.png"
     f"?key={CARTO_KEY}"
 )
-CARTO_ATTRIBUTION = (
+carto_attr = (
     '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors, '
     '&copy; <a href="https://carto.com/attributions">CARTO</a>'
 )
 
-def _capFeatures(gdf, maxRows=MAX_FEATURES_PER_LAYER):
-    if gdf is None or len(gdf) <= maxRows:
-        return gdf
-    try:
-        areas = gdf.geometry.area
-        return gdf.loc[areas.sort_values(ascending=False).index[:maxRows]]
-    except Exception:
-        return gdf.iloc[:maxRows]
-
-
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+PHOTON_URL = "https://photon.komoot.io/api/"
+req_headers = {"User-Agent": "global-campus-navigator/1.0 (streamlit-app)"}
+RATE_LIMIT_GAP = 1.5
+
+# public overpass servers get overloaded, so we try them in random order
+OVERPASS_MIRRORS = [
+    "https://overpass-api.de/api",
+    "https://overpass.kumi.systems/api",
+    "https://overpass.private.coffee/api",
+]
 
 WALKWAY_VALUES = ["footway", "path", "pedestrian", "steps"]
 ROAD_VALUES = ["service", "residential", "unclassified", "living_street"]
@@ -56,8 +60,62 @@ layer_labels = {
     "buildings":  "Campus Buildings",
     "walkways":   "Pedestrian Paths",
     "roads":      "Roads & Service Routes",
-    "facilities": "Specialized Facilities"
+    "facilities": "Specialized Facilities",
 }
+
+LAYER_COLORS = {
+    "buildings":  "#3A6EA5",
+    "walkways":   "#1F6F54",
+    "roads":      "#726B5E",
+    "facilities": "#A02B5C",
+}
+
+SIMPLIFY_TOLERANCE = 0.00005
+MIN_SPAN_DEG = 0.0018
+
+NOT_CAMPUS = {"leisure", "shop", "tourism", "highway", "natural"}
+
+EDU_TAG_PAIRS = {
+    ("amenity", "university"),
+    ("amenity", "college"),
+    ("amenity", "school"),
+    ("amenity", "research_institute"),
+    ("landuse", "education"),
+    ("boundary", "educational"),
+    ("place", "campus"),
+}
+
+campus_name_hints = (
+    "university",
+    "college",
+    "institute of technology",
+    "polytechnic",
+    "academy",
+    "ecole",
+    "universidad",
+    "universita",
+    "mit",
+    "caltech",
+    "mit.edu",
+)
+
+_campusNameHintPatterns = [
+    re.compile(r"\b" + re.escape(h) + r"\b", re.IGNORECASE) for h in campus_name_hints
+]
+
+FALLBACK_TAG = {
+    "buildings":  ("building", "Building"),
+    "facilities": ("amenity", "Facility"),
+    "walkways":   ("highway", "Path"),
+    "roads":      ("highway", "Road"),
+}
+
+USELESS_CATEGORY_VALUES = {"yes", "university", "college"}
+
+_nomLastCallTime = [0.0]
+# nominatim wants roughly one request per second
+_nomLock = threading.Lock()
+
 
 def styleFor(color, fill, opacity, weight, dashed=False):
     s = {
@@ -68,6 +126,7 @@ def styleFor(color, fill, opacity, weight, dashed=False):
         s["dashArray"] = "6, 6"
     return lambda feat: s
 
+
 campusStyles = {
     "buildings":  styleFor("#3A6EA5", "#3A6EA5", 0.5,  1.2),
     "walkways":   styleFor("#1F6F54", "#1F6F54", 0.0,  2.75, dashed=True),
@@ -75,19 +134,19 @@ campusStyles = {
     "facilities": styleFor("#A02B5C", "#A02B5C", 0.7,  1.5),
 }
 
-LAYER_COLORS = {
-    "buildings":  "#3A6EA5",
-    "walkways":   "#1F6F54",
-    "roads":      "#726B5E",
-    "facilities": "#A02B5C",
-}
 
-req_headers = {"User-Agent": "global-campus-navigator/1.0 (streamlit-app)"}
-RATE_LIMIT_GAP = 1.5
+def cap_features(gdf, maxRows=None):
+    maxRows = maxRows or max_rows
+    if gdf is None or len(gdf) <= maxRows:
+        return gdf
+    try:
+        areas = gdf.geometry.area
+        return gdf.loc[areas.sort_values(ascending=False).index[:maxRows]]
+    except Exception:
+        return gdf.iloc[:maxRows]
 
-def runWithDeadline(fn, args, seconds, label):
-    """runs fn in a thread, bails after seconds no matter what"""
-    import concurrent.futures
+
+def run_with_deadline(fn, args, seconds, label):
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     future = pool.submit(fn, *args)
     try:
@@ -105,11 +164,6 @@ def runWithDeadline(fn, args, seconds, label):
         pool.shutdown(wait=False)
         raise
 
-OVERPASS_MIRRORS = [
-    "https://overpass-api.de/api",
-    "https://overpass.kumi.systems/api",
-    "https://overpass.private.coffee/api",
-]
 
 @st.cache_resource
 def initOsmnx():
@@ -120,7 +174,8 @@ def initOsmnx():
     ox.settings.overpass_url = OVERPASS_MIRRORS[0]
     return True
 
-def fetchFromOverpass(fetchFn, *args):
+
+def fetch_from_overpass(fetchFn, *args):
     mirrors = list(OVERPASS_MIRRORS)
     random.shuffle(mirrors)
     lastErr = None
@@ -140,10 +195,6 @@ def fetchFromOverpass(fetchFn, *args):
     )
 
 
-
-_nomLastCallTime = [0.0]
-_nomLock = threading.Lock()
-
 def throttleNominatim():
     with _nomLock:
         gap = RATE_LIMIT_GAP - (time.monotonic() - _nomLastCallTime[0])
@@ -151,39 +202,11 @@ def throttleNominatim():
             time.sleep(gap)
         _nomLastCallTime[0] = time.monotonic()
 
+
 initOsmnx()
 
-NOT_CAMPUS = {"leisure", "shop", "tourism", "highway", "natural"}
 
-EDU_TAG_PAIRS = {
-    ("amenity", "university"),
-    ("amenity", "college"),
-    ("amenity", "school"),
-    ("amenity", "research_institute"),
-    ("landuse", "education"),
-    ("boundary", "educational"),
-    ("place", "campus"),
-}
-
-campusNameHints = (
-    "university",
-    "college",
-    "institute of technology",
-    "polytechnic",
-    "academy",
-    "ecole",
-    "universidad",
-    "universita",
-    "mit",
-    "caltech",
-    "mit.edu",
-)
-
-_campusNameHintPatterns = [
-    re.compile(r"\b" + re.escape(h) + r"\b", re.IGNORECASE) for h in campusNameHints
-]
-
-def looksLikeCampus(nominatimResult):
+def looks_like_campus(nominatimResult):
     pair = (nominatimResult.get("class"), nominatimResult.get("type"))
     if pair in EDU_TAG_PAIRS:
         return True
@@ -194,7 +217,6 @@ def looksLikeCampus(nominatimResult):
         dn = str(dn)
     return any(p.search(dn) for p in _campusNameHintPatterns)
 
-PHOTON_URL = "https://photon.komoot.io/api/"
 
 def queryPhoton(q, limit=5):
     p = {"q": q, "limit": limit}
@@ -223,6 +245,7 @@ def queryPhoton(q, limit=5):
             "lon": coords[0] if coords else None,
         })
     return out
+
 
 def queryNominatim(q, limit=5):
     p = {
@@ -270,15 +293,138 @@ def queryNominatim(q, limit=5):
         f"Raw response: `{lastBody or '(empty)'}`"
     )
 
-FALLBACK_TAG = {
-    "buildings":  ("building", "Building"),
-    "facilities": ("amenity", "Facility"),
-    "walkways":   ("highway", "Path"),
-    "roads":      ("highway", "Road"),
-}
 
-USELESS_CATEGORY_VALUES = {"yes", "university", "college"}
+def _alternateNameGuess(name):
+    m = re.match(r'^(university|college)\s+of\s+(.+)$', name.strip(), re.IGNORECASE)
+    if not m:
+        return None
+    kind, rest = m.groups()
+    return f"{rest.strip()} {kind.title()}"
 
+
+def _bboxArea(hit):
+    bbox = hit.get("boundingbox")
+    if not bbox or len(bbox) != 4:
+        return 0.0
+    try:
+        south, north, west, east = (float(v) for v in bbox)
+        return max(0.0, north - south) * max(0.0, east - west)
+    except Exception:
+        return 0.0
+
+
+def findCampus(name):
+    try:
+        results = queryNominatim(name)
+    except ValueError as nomErr:
+        try:
+            results = queryPhoton(name)
+        except Exception:
+            raise nomErr
+
+    if not results:
+        raise ValueError(f'No results found for **"{name}"** on OpenStreetMap.\n\nTry a more specific name, e.g. `"{name}, City, Country"`')
+
+    results.sort(key=lambda r: not looks_like_campus(r))
+    edu_hits = [r for r in results if looks_like_campus(r)]
+
+    if not edu_hits:
+        alt = _alternateNameGuess(name)
+        if alt:
+            try:
+                altResults = queryNominatim(alt)
+                altResults.sort(key=lambda r: not looks_like_campus(r))
+                altEduHits = [r for r in altResults if looks_like_campus(r)]
+                if altEduHits:
+                    edu_hits = altEduHits
+                    results = altResults
+            except Exception:
+                pass
+
+    if not edu_hits:
+        name_lower = name.lower()
+        query_looks_educational = any(p.search(name_lower) for p in _campusNameHintPatterns)
+        if query_looks_educational and results:
+            edu_hits = results[:1]
+
+    if not edu_hits:
+        raise ValueError(
+            f'None of the search results for **"{name}"** look like a university or college.\n\n'
+            f'Try the institution\'s full official name (for example, "Carleton University" '
+            f'rather than "University of Carleton"), or add a city/country for a more specific match.'
+        )
+
+    for hit in edu_hits:
+        geo = hit.get("geojson") or {}
+        if geo.get("type") not in ("Polygon", "MultiPolygon"):
+            continue
+        try:
+            g = shape(geo)
+            if not g.is_valid:
+                g = g.buffer(0)
+            if g.is_empty:
+                continue
+            return hit.get("display_name", name), g.wkt
+        except Exception:
+            continue
+
+    typeRank = {"relation": 0, "way": 1, "node": 2}
+    ranked = sorted(
+        edu_hits,
+        key=lambda h: (typeRank.get(h.get("osm_type"), 3), -_bboxArea(h))
+    )
+    top_hit = ranked[0]
+    hitName = top_hit.get("display_name", name)
+
+    bbox = top_hit.get("boundingbox")
+    if bbox and len(bbox) == 4:
+        try:
+            south, north, west, east = (float(v) for v in bbox)
+            if (north - south) < MIN_SPAN_DEG or (east - west) < MIN_SPAN_DEG:
+                cy, cx = (north + south) / 2, (east + west) / 2
+                south, north = cy - MIN_SPAN_DEG, cy + MIN_SPAN_DEG
+                west, east = cx - MIN_SPAN_DEG, cx + MIN_SPAN_DEG
+            g = shapelyBox(west, south, east, north)
+            return hitName, g.wkt
+        except Exception:
+            pass
+
+    lat, lon = top_hit.get("lat"), top_hit.get("lon")
+    if lat is not None and lon is not None:
+        try:
+            lat, lon = float(lat), float(lon)
+            g = shapelyBox(lon - MIN_SPAN_DEG, lat - MIN_SPAN_DEG,
+                            lon + MIN_SPAN_DEG, lat + MIN_SPAN_DEG)
+            return hitName, g.wkt
+        except Exception:
+            pass
+
+    raise ValueError(
+        f'**"{hitName}"** was found but has no boundary polygon, bounding box, or even '
+        f'coordinates on OpenStreetMap.\n\n'
+        f'Try a more specific search or check [openstreetmap.org](https://www.openstreetmap.org).'
+    )
+
+
+findCampus = st.cache_data(show_spinner=False, ttl="24h")(findCampus)
+
+
+def _mergeBounds(existing, south, west, north, east):
+    if existing is None:
+        return (south, west, north, east)
+    es, ew, en, ee = existing
+    return (min(es, south), min(ew, west), max(en, north), max(ee, east))
+
+
+def _simplify(gdf):
+    if gdf is None or gdf.empty:
+        return gdf
+    try:
+        gdf = gdf.copy()
+        gdf["geometry"] = gdf.geometry.simplify(SIMPLIFY_TOLERANCE, preserve_topology=True)
+        return gdf
+    except Exception:
+        return gdf
 
 
 def _friendlySeries(s):
@@ -289,7 +435,8 @@ def _friendlySeries(s):
     s = s.mask(useless | (s == ""))
     return s.str.replace("_", " ", regex=False).str.replace("-", " ", regex=False).str.title()
 
-def addLabelAndTrim(gdf, layer_key):
+
+def addLabelAndTrim(gdf, layerKey):
     if gdf is None or gdf.empty:
         return gdf
     geom_col = gdf.geometry.name
@@ -298,7 +445,7 @@ def addLabelAndTrim(gdf, layer_key):
         keep_cols.append("osmid")
     try:
         gdf = gdf.copy()
-        tag_col, fallback_word = FALLBACK_TAG[layer_key]
+        tag_col, fallback_word = FALLBACK_TAG[layerKey]
 
         name_s = gdf["name"] if "name" in gdf.columns else pd.Series([None] * len(gdf), index=gdf.index)
         name_s = name_s.map(lambda v: v.strip() if isinstance(v, str) else None)
@@ -307,7 +454,7 @@ def addLabelAndTrim(gdf, layer_key):
         primary_col = gdf[tag_col] if tag_col in gdf.columns else pd.Series([None] * len(gdf), index=gdf.index)
         category = _friendlySeries(primary_col)
 
-        if layer_key == "facilities" and "leisure" in gdf.columns:
+        if layerKey == "facilities" and "leisure" in gdf.columns:
             category = category.fillna(_friendlySeries(gdf["leisure"]))
 
         label = name_s.where(has_name, category.fillna(fallback_word))
@@ -321,30 +468,7 @@ def addLabelAndTrim(gdf, layer_key):
         return gdf
 
 
-
-SIMPLIFY_TOLERANCE = 0.00005
-
-
-def _simplify(gdf):
-    if gdf is None or gdf.empty:
-        return gdf
-    try:
-        gdf = gdf.copy()
-        gdf["geometry"] = gdf.geometry.simplify(SIMPLIFY_TOLERANCE, preserve_topology=True)
-        return gdf
-    except Exception:
-        return gdf
-
-def _mergeBounds(existing, south, west, north, east):
-    if existing is None:
-        return (south, west, north, east)
-    es, ew, en, ee = existing
-    return (min(es, south), min(ew, west), max(en, north), max(ee, east))
-
-
-
 def _haversineMeters(lat1, lon1, lat2, lon2):
-    import math
     R = 6371000
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
@@ -353,10 +477,10 @@ def _haversineMeters(lat1, lon1, lat2, lon2):
     return 2 * R * math.asin(math.sqrt(a))
 
 
-def nearbyLocations(focusLoc, focusName, allLocs, maxResults=4, maxMeters=300):
-    if not focusLoc:
+def nearbyLocations(focus_loc, focusName, allLocs, maxResults=4, maxMeters=300):
+    if not focus_loc:
         return []
-    flat, flon = focusLoc
+    flat, flon = focus_loc
     out = []
     for name, (lat, lon) in allLocs.items():
         if name == focusName:
@@ -368,7 +492,7 @@ def nearbyLocations(focusLoc, focusName, allLocs, maxResults=4, maxMeters=300):
     return out[:maxResults]
 
 
-def _editDistance(a, b):
+def edit_distance(a, b):
     if a == b:
         return 0
     la, lb = len(a), len(b)
@@ -385,6 +509,7 @@ def _editDistance(a, b):
         prev = cur
     return prev[lb]
 
+
 def _fuzzyScore(query, candidate):
     q = query.lower().strip()
     c = candidate.lower()
@@ -394,11 +519,12 @@ def _fuzzyScore(query, candidate):
         return 1000 - c.index(q) - abs(len(c) - len(q)) * 0.1
     words = re.split(r"[\s()]+", c)
     candidates = [w for w in words if w] + [c]
-    bestWord, best = min(((w, _editDistance(q, w)) for w in candidates), key=lambda t: t[1])
+    bestWord, best = min(((w, edit_distance(q, w)) for w in candidates), key=lambda t: t[1])
     maxAllowed = max(1, min(len(q), len(bestWord)) // 2)
     if best > maxAllowed:
         return 0
     return 500 - best * 40
+
 
 def fuzzySearch(query, names, limit=6, minScore=1):
     scored = [(n, _fuzzyScore(query, n)) for n in names]
@@ -432,7 +558,10 @@ def _quickSearchBody(namedLocs, namedRds):
         else:
             st.caption("No matches -- try a different spelling.")
 
+
+# fragments need a newer streamlit, so fall back to a plain function on older installs
 quickSearchWidget = st.fragment(_quickSearchBody) if hasattr(st, "fragment") else _quickSearchBody
+
 
 def _geomBounds(geometry):
     if not geometry:
@@ -456,8 +585,7 @@ def _geomBounds(geometry):
     return min(xs), min(ys), max(xs), max(ys)
 
 
-
-def _roundGeoJson(geo, precision=5):
+def round_geojson(geo, precision=5):
     if not geo:
         return geo
 
@@ -473,6 +601,7 @@ def _roundGeoJson(geo, precision=5):
         if geom and geom.get("coordinates") is not None:
             geom["coordinates"] = _round(geom["coordinates"])
     return geo
+
 
 def _stripUnusedProps(geo, keep=("Label",)):
     if not geo:
@@ -535,10 +664,9 @@ def _propagateRoadNames(features, maxHops=6):
 
 
 def _overpassFetch(poly, tags):
-    """picks bbox query vs polygon query, whichever is cheaper"""
-    QUERY_SIMPLIFY_TOLERANCE = 0.0003
+    query_tol = 0.0003
     try:
-        simplified = poly.simplify(QUERY_SIMPLIFY_TOLERANCE, preserve_topology=True)
+        simplified = poly.simplify(query_tol, preserve_topology=True)
         if not simplified.is_empty and simplified.is_valid:
             poly = simplified
     except Exception:
@@ -551,13 +679,13 @@ def _overpassFetch(poly, tags):
         return ox.features_from_bbox((west, south, east, north), tags)
     return ox.features_from_polygon(poly, tags)
 
+
 def fetchCampusFeatures(polygon_wkt):
-    """one combined overpass call for everything"""
     from shapely import wkt as swkt
     poly = swkt.loads(polygon_wkt)
 
     allowedHighways = WALKWAY_VALUES + ROAD_VALUES
-    gdf = fetchFromOverpass(_overpassFetch, poly, {
+    gdf = fetch_from_overpass(_overpassFetch, poly, {
         "highway": allowedHighways,
         "building": True,
         "amenity": FACILITY_AMENITY_VALUES,
@@ -580,10 +708,10 @@ def fetchCampusFeatures(polygon_wkt):
     buildings = gdf[has_building].copy()
     facilities = gdf[has_amenity | has_leisure].copy()
 
-    walkways = _capFeatures(walkways)
-    roads = _capFeatures(roads)
-    buildings = _capFeatures(buildings)
-    facilities = _capFeatures(facilities)
+    walkways = cap_features(walkways)
+    roads = cap_features(roads)
+    buildings = cap_features(buildings)
+    facilities = cap_features(facilities)
 
     walkways = addLabelAndTrim(walkways, "walkways")
     roads = addLabelAndTrim(roads, "roads")
@@ -592,8 +720,8 @@ def fetchCampusFeatures(polygon_wkt):
 
     walkGeo = walkways.__geo_interface__ if walkways is not None and not walkways.empty else None
     roadGeo = roads.__geo_interface__ if roads is not None and not roads.empty else None
-    walkGeo = _roundGeoJson(walkGeo)
-    roadGeo = _roundGeoJson(roadGeo)
+    walkGeo = round_geojson(walkGeo)
+    roadGeo = round_geojson(roadGeo)
 
     allFeatures = []
     for geo in (roadGeo, walkGeo):
@@ -623,8 +751,9 @@ def fetchCampusFeatures(polygon_wkt):
     walkGeo = _stripUnusedProps(walkGeo)
 
     return roadGeo, walkGeo, namedRoads, namedRoadGeo, buildings, facilities
-fetchCampusFeatures = st.cache_data(show_spinner=False, ttl="24h")(fetchCampusFeatures)
 
+
+fetchCampusFeatures = st.cache_data(show_spinner=False, ttl="24h")(fetchCampusFeatures)
 
 
 def getIds(gdf):
@@ -664,126 +793,12 @@ def stripDuplicateBuildings(buildingsDf, facilitiesDf):
     except Exception:
         return buildingsDf
 
-def _alternateNameGuess(name):
-    m = re.match(r'^(university|college)\s+of\s+(.+)$', name.strip(), re.IGNORECASE)
-    if not m:
-        return None
-    kind, rest = m.groups()
-    return f"{rest.strip()} {kind.title()}"
-
-
-
-def findCampus(name):
-    try:
-        results = queryNominatim(name)
-    except ValueError as nomErr:
-        try:
-            results = queryPhoton(name)
-        except Exception:
-            raise nomErr
-
-    if not results:
-        raise ValueError(f'No results found for **"{name}"** on OpenStreetMap.\n\nTry a more specific name, e.g. `"{name}, City, Country"`')
-
-    results.sort(key=lambda r: not looksLikeCampus(r))
-    edu_hits = [r for r in results if looksLikeCampus(r)]
-
-    if not edu_hits:
-        alt = _alternateNameGuess(name)
-        if alt:
-            try:
-                altResults = queryNominatim(alt)
-                altResults.sort(key=lambda r: not looksLikeCampus(r))
-                altEduHits = [r for r in altResults if looksLikeCampus(r)]
-                if altEduHits:
-                    edu_hits = altEduHits
-                    results = altResults
-            except Exception:
-                pass
-
-    if not edu_hits:
-        name_lower = name.lower()
-        query_looks_educational = any(p.search(name_lower) for p in _campusNameHintPatterns)
-        if query_looks_educational and results:
-            edu_hits = results[:1]
-
-    if not edu_hits:
-        raise ValueError(
-            f'None of the search results for **"{name}"** look like a university or college.\n\n'
-            f'Try the institution\'s full official name (for example, "Carleton University" '
-            f'rather than "University of Carleton"), or add a city/country for a more specific match.'
-        )
-
-    for hit in edu_hits:
-        geo = hit.get("geojson") or {}
-        if geo.get("type") not in ("Polygon", "MultiPolygon"):
-            continue
-        try:
-            g = shape(geo)
-            if not g.is_valid:
-                g = g.buffer(0)
-            if g.is_empty:
-                continue
-            return hit.get("display_name", name), g.wkt
-        except Exception:
-            continue
-
-    def _bboxArea(hit):
-        bbox = hit.get("boundingbox")
-        if not bbox or len(bbox) != 4:
-            return 0.0
-        try:
-            south, north, west, east = (float(v) for v in bbox)
-            return max(0.0, north - south) * max(0.0, east - west)
-        except Exception:
-            return 0.0
-
-    typeRank = {"relation": 0, "way": 1, "node": 2}
-    ranked = sorted(
-        edu_hits,
-        key=lambda h: (typeRank.get(h.get("osm_type"), 3), -_bboxArea(h))
-    )
-    top_hit = ranked[0]
-    hitName = top_hit.get("display_name", name)
-
-    MIN_SPAN_DEG = 0.0018
-
-    bbox = top_hit.get("boundingbox")
-    if bbox and len(bbox) == 4:
-        try:
-            south, north, west, east = (float(v) for v in bbox)
-            if (north - south) < MIN_SPAN_DEG or (east - west) < MIN_SPAN_DEG:
-                cy, cx = (north + south) / 2, (east + west) / 2
-                south, north = cy - MIN_SPAN_DEG, cy + MIN_SPAN_DEG
-                west, east = cx - MIN_SPAN_DEG, cx + MIN_SPAN_DEG
-            g = shapelyBox(west, south, east, north)
-            return hitName, g.wkt
-        except Exception:
-            pass
-
-    lat, lon = top_hit.get("lat"), top_hit.get("lon")
-    if lat is not None and lon is not None:
-        try:
-            lat, lon = float(lat), float(lon)
-            g = shapelyBox(lon - MIN_SPAN_DEG, lat - MIN_SPAN_DEG,
-                            lon + MIN_SPAN_DEG, lat + MIN_SPAN_DEG)
-            return hitName, g.wkt
-        except Exception:
-            pass
-
-    raise ValueError(
-        f'**"{hitName}"** was found but has no boundary polygon, bounding box, or even '
-        f'coordinates on OpenStreetMap.\n\n'
-        f'Try a more specific search or check [openstreetmap.org](https://www.openstreetmap.org).'
-    )
-findCampus = st.cache_data(show_spinner=False, ttl="24h")(findCampus)
 
 def _fetchJob(fn, args, deadline_seconds, label):
-    """returns (result, err, didRetry)"""
     lastErr = None
     for attempt in range(2):
         try:
-            result = runWithDeadline(fn, args, deadline_seconds, label)
+            result = run_with_deadline(fn, args, deadline_seconds, label)
             return result, None, attempt > 0
         except Exception as e:
             lastErr = e
@@ -797,7 +812,7 @@ def prepareCampusData(polygon_wkt, active_layers, status):
     poly = swkt.loads(polygon_wkt)
     minx, miny, maxx, maxy = poly.bounds
 
-    layerData = {}
+    layer_data = {}
 
     status.update(label="Fetching campus data...")
     result, fetchErr, wasRetried = _fetchJob(
@@ -812,12 +827,12 @@ def prepareCampusData(polygon_wkt, active_layers, status):
                      f"Paths: {len(walkGeo['features']) if walkGeo else 0} segments")
     else:
         status.write(f"⚠️ Campus data unavailable after retry ({fetchErr}).")
-    layerData["roads"] = roadGeo
-    layerData["walkways"] = walkGeo
+    layer_data["roads"] = roadGeo
+    layer_data["walkways"] = walkGeo
 
     bldGdf = stripDuplicateBuildings(bldGdf, facGdf)
-    layerData["buildings"] = _stripUnusedProps(_roundGeoJson(bldGdf.__geo_interface__)) if bldGdf is not None and not bldGdf.empty else None
-    layerData["facilities"] = _stripUnusedProps(_roundGeoJson(facGdf.__geo_interface__)) if facGdf is not None and not facGdf.empty else None
+    layer_data["buildings"] = _stripUnusedProps(round_geojson(bldGdf.__geo_interface__)) if bldGdf is not None and not bldGdf.empty else None
+    layer_data["facilities"] = _stripUnusedProps(round_geojson(facGdf.__geo_interface__)) if facGdf is not None and not facGdf.empty else None
     status.write(f"Buildings: {len(bldGdf) if bldGdf is not None else 0}, "
                  f"Facilities: {len(facGdf) if facGdf is not None else 0}")
 
@@ -825,9 +840,9 @@ def prepareCampusData(polygon_wkt, active_layers, status):
     counts = {}
     foundAnything = False
     for k in drawOrder:
-        if k not in layerData:
+        if k not in layer_data:
             continue
-        geo = layerData[k]
+        geo = layer_data[k]
         if not geo or not geo.get("features"):
             counts[k] = 0
             continue
@@ -871,7 +886,7 @@ def prepareCampusData(polygon_wkt, active_layers, status):
                 continue
 
     bounds = (miny, minx, maxy, maxx)
-    return layerData, counts, namedLocations, namedRoads, namedRoadGeo, bounds
+    return layer_data, counts, namedLocations, namedRoads, namedRoadGeo, bounds
 
 
 def addBranding(m):
@@ -890,10 +905,12 @@ def addBranding(m):
     branding._template = Template(branding_html)
     m.get_root().add_child(branding)
 
+
 def makeTooltip():
     return folium.GeoJsonTooltip(fields=["Label"], labels=False, sticky=False)
 
-def renderCampusMap(layerData, counts, bounds, visibleLayers, focusName=None, focusLoc=None,
+
+def renderCampusMap(layer_data, counts, bounds, visibleLayers, focusName=None, focus_loc=None,
                      focusRoad=None, focusRoadBounds=None, focusRoadGeo=None):
     miny, minx, maxy, maxx = bounds
     cLat = (miny + maxy) / 2
@@ -908,7 +925,7 @@ def renderCampusMap(layerData, counts, bounds, visibleLayers, focusName=None, fo
     )
     folium.TileLayer(
         tiles=CARTO_TILE_URL,
-        attr=CARTO_ATTRIBUTION,
+        attr=carto_attr,
         name="CartoDB Positron",
         subdomains=["a", "b", "c", "d"],
         max_zoom=19,
@@ -955,7 +972,7 @@ def renderCampusMap(layerData, counts, bounds, visibleLayers, focusName=None, fo
     for k in drawOrder:
         if k not in visibleLayers:
             continue
-        geo = layerData.get(k)
+        geo = layer_data.get(k)
         if not geo or not geo.get("features"):
             continue
         folium.GeoJson(
@@ -991,8 +1008,8 @@ def renderCampusMap(layerData, counts, bounds, visibleLayers, focusName=None, fo
 
     addBranding(m)
 
-    if focusName and focusLoc:
-        flat, flon = focusLoc
+    if focusName and focus_loc:
+        flat, flon = focus_loc
         pad = 0.0012
         m.fit_bounds([[flat - pad, flon - pad], [flat + pad, flon + pad]])
         folium.CircleMarker(
@@ -1025,6 +1042,7 @@ def renderCampusMap(layerData, counts, bounds, visibleLayers, focusName=None, fo
         m.fit_bounds([[miny, minx], [maxy, maxx]])
 
     return m
+
 
 st.markdown("""
 <style>
@@ -1072,6 +1090,15 @@ st.markdown("""
 
 use_facilities = True
 
+
+def _clearRoadSelection():
+    st.session_state["road_select"] = None
+
+
+def _clearBuildingSelection():
+    st.session_state["building_select"] = None
+
+
 with st.sidebar:
     st.caption(BUILD_LABEL)
     st.subheader("Search")
@@ -1110,12 +1137,6 @@ with st.sidebar:
     namedRds = st.session_state.get("namedRoads", {})
     focusName = None
     focusRoad = None
-
-    def _clearRoadSelection():
-        st.session_state["road_select"] = None
-
-    def _clearBuildingSelection():
-        st.session_state["building_select"] = None
 
     if namedLocs or namedRds:
         st.divider()
@@ -1169,7 +1190,7 @@ if "campusData" not in st.session_state:
     err = None
     with st.status(f'Looking up "{searchTerm}"... (large campuses can take 30-60s)', expanded=True) as status:
         try:
-            campusName, campusPoly = runWithDeadline(findCampus, (searchTerm,), 60, "Campus lookup")
+            campusName, campusPoly = run_with_deadline(findCampus, (searchTerm,), 60, "Campus lookup")
             status.update(label=f"Found: {campusName}", state="running")
             status.write(f"Matched: {campusName}")
         except TimeoutError as e:
@@ -1188,10 +1209,10 @@ if "campusData" not in st.session_state:
 
         if err is None:
             try:
-                layerData, layerCounts, namedLocations, namedRoads, namedRoadGeo, bounds = \
+                layer_data, layerCounts, namedLocations, namedRoads, namedRoadGeo, bounds = \
                     prepareCampusData(campusPoly, active_layers, status)
                 st.session_state["campusData"] = {
-                    "layerData": layerData,
+                    "layerData": layer_data,
                     "counts": layerCounts,
                     "bounds": bounds,
                     "campusName": campusName,
@@ -1219,9 +1240,9 @@ if "campusData" not in st.session_state:
 
 campusData = st.session_state["campusData"]
 
-focusLoc = None
+focus_loc = None
 if focusName and focusName in st.session_state.get("namedLocations", {}):
-    focusLoc = st.session_state["namedLocations"][focusName]
+    focus_loc = st.session_state["namedLocations"][focusName]
 else:
     focusName = None
 
@@ -1239,7 +1260,7 @@ campusMap = renderCampusMap(
     campusData["bounds"],
     visibleLayers=set(active_layers),
     focusName=focusName,
-    focusLoc=focusLoc,
+    focus_loc=focus_loc,
     focusRoad=focusRoad,
     focusRoadBounds=focusRoadBounds,
     focusRoadGeo=focusRoadGeo,
@@ -1247,10 +1268,8 @@ campusMap = renderCampusMap(
 
 campusMap.to_streamlit(height=620)
 
-if focusName and focusLoc:
-    nearby = nearbyLocations(focusLoc, focusName, st.session_state.get("namedLocations", {}))
+if focusName and focus_loc:
+    nearby = nearbyLocations(focus_loc, focusName, st.session_state.get("namedLocations", {}))
     if nearby:
         chips = " · ".join(f"{n} ({int(round(d))}m)" for n, d in nearby)
         st.caption(f"🧭 Near **{focusName}**: {chips}")
-
-# 
