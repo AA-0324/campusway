@@ -24,7 +24,7 @@ st.set_page_config(
     page_icon="🧭",
 )
 
-BUILD_LABEL = "v2.6"
+BUILD_LABEL = "v3"
 
 MAX_FEATURES_PER_LAYER = 2500
 max_rows = MAX_FEATURES_PER_LAYER
